@@ -73,6 +73,8 @@ pub enum UniswapV2Error {
     DivisionByZero,
     #[error("Rounding Error")]
     RoundingError,
+    #[error("Invalid pool data - pool does not exist or has no data")]
+    InvalidPoolData,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -186,11 +188,13 @@ impl AutomatedMarketMaker for UniswapV2Pool {
 
         let res = deployer.call_raw().block(block_number).await?;
 
+        println!("res: {:?} {:?} {:?} ", res, self.address(), block_number);
+
         let pool_data =
             <Vec<(Address, Address, u128, u128, u32, u32)> as SolValue>::abi_decode(&res)?[0];
 
         if pool_data.0.is_zero() {
-            todo!("Return error");
+            return Err(UniswapV2Error::InvalidPoolData.into());
         }
 
         self.token_a = Token::new_with_decimals(pool_data.0, pool_data.4 as u8);

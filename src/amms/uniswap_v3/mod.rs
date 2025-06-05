@@ -771,7 +771,7 @@ impl UniswapV3Factory {
         let sync_provider = provider.clone();
         let mut futures = FuturesUnordered::new();
 
-        let sync_step = 100_000;
+        let sync_step = 1000;
         let mut latest_block = self.creation_block;
         while latest_block < block_number.as_u64().unwrap_or_default() {
             let mut block_filter = disc_filter.clone();
@@ -780,6 +780,7 @@ impl UniswapV3Factory {
 
             block_filter = block_filter.from_block(from_block);
             block_filter = block_filter.to_block(to_block);
+            println!("from_block: {}, to_block: {}", from_block, to_block);
 
             let sync_provider = sync_provider.clone();
 
@@ -874,7 +875,7 @@ impl UniswapV3Factory {
         N: Network,
         P: Provider<N> + Clone,
     {
-        let step = 255;
+        let step = 10;
 
         let mut futures = FuturesUnordered::new();
         pools.chunks_mut(step).for_each(|group| {
@@ -924,7 +925,7 @@ impl UniswapV3Factory {
     {
         let mut futures: FuturesUnordered<BoxFuture<'_, _>> = FuturesUnordered::new();
 
-        let max_range = 6900;
+        let max_range = 25;
         let mut group_range = 0;
         let mut group = vec![];
 
@@ -1076,7 +1077,7 @@ impl UniswapV3Factory {
             .collect::<Vec<(Address, Vec<Signed<24, 1>>)>>();
 
         let mut futures: FuturesUnordered<BoxFuture<'_, _>> = FuturesUnordered::new();
-        let max_ticks = 60;
+        let max_ticks = 5;
         let mut group_ticks = 0;
         let mut group = vec![];
 

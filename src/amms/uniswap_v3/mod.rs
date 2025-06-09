@@ -127,6 +127,7 @@ pub enum UniswapV3Error {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UniswapV3Pool {
     pub address: Address,
+    pub factory_address: Address,
     pub token_a: Token,
     pub token_b: Token,
     pub liquidity: u128,
@@ -610,9 +611,10 @@ impl AutomatedMarketMaker for UniswapV3Pool {
 
 impl UniswapV3Pool {
     // Create a new, unsynced UniswapV3 pool
-    pub fn new(address: Address) -> Self {
+    pub fn new(address: Address, factory_address: Address) -> Self {
         Self {
             address,
+            factory_address,
             ..Default::default()
         }
     }
@@ -1186,6 +1188,7 @@ impl AutomatedMarketMakerFactory for UniswapV3Factory {
 
         Ok(AMM::UniswapV3Pool(UniswapV3Pool {
             address: pool_created_event.pool,
+            factory_address: self.address,
             token_a: pool_created_event.token0.into(),
             token_b: pool_created_event.token1.into(),
             fee: pool_created_event.fee.to::<u32>(),
@@ -1270,7 +1273,7 @@ mod test {
 
         let provider = ProviderBuilder::new().connect_client(client);
 
-        let pool = UniswapV3Pool::new(address!("88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640"))
+        let pool = UniswapV3Pool::new(address!("88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640"), address!("0x0000000000000000000000000000000000000000"))
             .init(BlockId::latest(), provider.clone())
             .await?;
 
@@ -1439,7 +1442,7 @@ mod test {
 
         let current_block = BlockId::from(provider.get_block_number().await?);
 
-        let pool = UniswapV3Pool::new(address!("5d4F3C6fA16908609BAC31Ff148Bd002AA6b8c83"))
+        let pool = UniswapV3Pool::new(address!("5d4F3C6fA16908609BAC31Ff148Bd002AA6b8c83"), address!("0x0000000000000000000000000000000000000000"))
             .init(current_block, provider.clone())
             .await?;
 
@@ -1602,7 +1605,7 @@ mod test {
         let provider = ProviderBuilder::new().connect_client(client);
 
         let block_number = BlockId::from(22000114);
-        let pool = UniswapV3Pool::new(address!("88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640"))
+        let pool = UniswapV3Pool::new(address!("88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640"), address!("0x0000000000000000000000000000000000000000"))
             .init(block_number, provider.clone())
             .await?;
 

@@ -80,6 +80,7 @@ pub enum UniswapV2Error {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UniswapV2Pool {
     pub address: Address,
+    pub factory_address: Address,
     pub token_a: Token,
     pub token_b: Token,
     pub reserve_0: u128,
@@ -216,10 +217,10 @@ pub fn u128_to_float(num: u128) -> Result<Float, AMMError> {
 
 impl UniswapV2Pool {
     // Create a new, unsynced UniswapV2 pool
-    // TODO: update the init function to derive the fee
-    pub fn new(address: Address, fee: usize) -> Self {
+    pub fn new(address: Address, factory_address: Address, fee: usize) -> Self {
         Self {
             address,
+            factory_address,
             fee,
             ..Default::default()
         }
@@ -530,6 +531,7 @@ impl AutomatedMarketMakerFactory for UniswapV2Factory {
         let event = IUniswapV2Factory::PairCreated::decode_log(&log.inner)?;
         Ok(AMM::UniswapV2Pool(UniswapV2Pool {
             address: event.pair,
+            factory_address: self.address,
             token_a: event.token0.into(),
             token_b: event.token1.into(),
             reserve_0: 0,
@@ -569,6 +571,7 @@ impl DiscoverySync for UniswapV2Factory {
                 .map(|pair| {
                     AMM::UniswapV2Pool(UniswapV2Pool {
                         address: pair,
+                        factory_address: self.address,
                         token_a: Address::default().into(),
                         token_b: Address::default().into(),
                         reserve_0: 0,

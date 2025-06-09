@@ -1,5 +1,6 @@
 use super::{
     balancer::BalancerPool, erc_4626::ERC4626Vault, error::AMMError, uniswap_v2::UniswapV2Pool,
+    uniswap_v2_variant::UniswapV2Pool as UniswapV2VariantPool,
     uniswap_v3::UniswapV3Pool,
 };
 use alloy::{
@@ -156,4 +157,4 @@ macro_rules! amm {
     };
 }
 
-amm!(UniswapV2Pool, UniswapV3Pool, ERC4626Vault, BalancerPool);
+amm!(UniswapV2Pool, UniswapV3Pool, ERC4626Vault, BalancerPool, UniswapV2VariantPool);

@@ -505,7 +505,7 @@ impl StateSpace {
             // Check if this is a pool creation event
             if let Some(factory) = Self::is_pool_creation_event(log, factories) {
                 match factory.create_pool(log.clone()) {
-                    Ok(mut new_amm) => {
+                    Ok(new_amm) => {
                         let pool_address = new_amm.address();
                         
                         // Initialize the new pool
@@ -666,7 +666,7 @@ impl StateSpace {
         use crate::amms::amm::AMM;
         
         // Try to create a fresh UniswapV3 pool since that's where underflow occurs
-        let fresh_pool = crate::amms::uniswap_v3::UniswapV3Pool::new(pool_address);
+        let fresh_pool = crate::amms::uniswap_v3::UniswapV3Pool::new(pool_address, Address::default());
         
         // Initialize it at the specific block to get clean state
         match fresh_pool.init(

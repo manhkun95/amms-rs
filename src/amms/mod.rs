@@ -17,6 +17,7 @@ pub mod factory;
 pub mod float;
 pub mod uniswap_v2;
 pub mod uniswap_v3;
+pub mod uniswap_v2_variant;
 
 sol! {
     #[sol(rpc)]

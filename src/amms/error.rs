@@ -1,5 +1,6 @@
 use super::{
     balancer::BalancerError, erc_4626::ERC4626VaultError, uniswap_v2::UniswapV2Error,
+    uniswap_v2_variant::UniswapV2Error as UniswapV2VariantError,
     uniswap_v3::UniswapV3Error,
 };
 use alloy::{primitives::FixedBytes, transports::TransportErrorKind};
@@ -17,6 +18,8 @@ pub enum AMMError {
     SolTypesError(#[from] alloy::sol_types::Error),
     #[error(transparent)]
     UniswapV2Error(#[from] UniswapV2Error),
+    #[error(transparent)]
+    UniswapV2VariantError(#[from] UniswapV2VariantError),
     #[error(transparent)]
     UniswapV3Error(#[from] UniswapV3Error),
     #[error(transparent)]

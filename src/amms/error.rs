@@ -2,6 +2,7 @@ use super::{
     balancer::BalancerError, erc_4626::ERC4626VaultError, uniswap_v2::UniswapV2Error,
     uniswap_v2_variant::UniswapV2Error as UniswapV2VariantError,
     uniswap_v3::UniswapV3Error,
+    uniswap_v3_variant::UniswapV3Error as UniswapV3VariantError,
 };
 use alloy::{primitives::FixedBytes, transports::TransportErrorKind};
 use thiserror::Error;
@@ -23,6 +24,8 @@ pub enum AMMError {
     #[error(transparent)]
     UniswapV3Error(#[from] UniswapV3Error),
     #[error(transparent)]
+    UniswapV3VariantError(#[from] UniswapV3VariantError),
+    #[error(transparent)]
     BalancerError(#[from] BalancerError),
     #[error(transparent)]
     ERC4626VaultError(#[from] ERC4626VaultError),
@@ -34,6 +37,8 @@ pub enum AMMError {
     UnrecognizedEventSignature(FixedBytes<32>),
     #[error(transparent)]
     JoinError(#[from] tokio::task::JoinError),
+    #[error("Invalid pool type")]
+    InvalidPoolType,
 }
 
 #[derive(Error, Debug)]

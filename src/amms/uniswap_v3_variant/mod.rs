@@ -5,12 +5,13 @@ use super::{
   get_token_decimals, Token,
 };
 use crate::amms::{
-  consts::U256_1, uniswap_v3::GetUniswapV3PoolTickBitmapBatchRequest::TickBitmapInfo,
+  consts::U256_1,
+  uniswap_v3::Info,
 };
 use alloy::{
   eips::BlockId,
   network::Network,
-  primitives::{Address, Bytes, Signed, B256, I256, U256},
+  primitives::{Address, Bytes, Signed, B256, I256, U256, U160},
   providers::Provider,
   rpc::types::{Filter, FilterSet, Log},
   sol,
@@ -32,6 +33,7 @@ use tracing::info;
 use uniswap_v3_math::error::UniswapV3MathError;
 use uniswap_v3_math::tick_math::{MAX_SQRT_RATIO, MAX_TICK, MIN_SQRT_RATIO, MIN_TICK};
 use GetUniswapV3PoolTickDataBatchRequest::TickDataInfo;
+use GetUniswapV3PoolTickBitmapBatchRequest::TickBitmapInfo;
 
 sol! {
   // UniswapV3Factory
@@ -43,8 +45,7 @@ sol! {
       event PoolCreated(
           address indexed token0,
           address indexed token1,
-          uint24 indexed fee,
-          int24 tickSpacing,
+          int24 indexed tickSpacing,
           address pool
       );
   }
@@ -94,18 +95,20 @@ sol! {
       function fee() external view returns (uint24);
       function token0() external view returns (address);
       function token1() external view returns (address);
-      function ticks(int24 tick) external view returns (
-        uint128 liquidityGross,
-        int128 liquidityNet,
-        uint256 feeGrowthOutside0X128,
-        uint256 feeGrowthOutside1X128,
-        int56 tickCumulativeOutside,
-        uint160 secondsPerLiquidityOutsideX128,
-        uint32 secondsOutside,
-        bool initialized
-    );
+      function liquidity() external view returns (uint128);
+      function slot0() external view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, bool unlocked);
       function tickBitmap(int16 wordPosition) external view returns (uint256);
-  }
+      function ticks(int24 tick) external view returns (
+            uint128 liquidityGross,
+            int128 liquidityNet,
+            uint256 feeGrowthOutside0X128,
+            uint256 feeGrowthOutside1X128,
+            int56 tickCumulativeOutside,
+            uint160 secondsPerLiquidityOutsideX128,
+            uint32 secondsOutside,
+            bool initialized
+        );
+    }
 }
 
 sol! {
@@ -147,23 +150,6 @@ pub struct UniswapV3Pool {
   pub tick_spacing: i32, // TODO: we can make this a u8, tick spacing will never exceed 200
   pub tick_bitmap: HashMap<i16, U256>,
   pub ticks: HashMap<i32, Info>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct Info {
-  pub liquidity_gross: u128,
-  pub liquidity_net: i128,
-  pub initialized: bool,
-}
-
-impl Info {
-  pub fn new(liquidity_gross: u128, liquidity_net: i128, initialized: bool) -> Self {
-      Info {
-          liquidity_gross,
-          liquidity_net,
-          initialized,
-      }
-  }
 }
 
 pub struct CurrentState {
@@ -606,16 +592,15 @@ impl AutomatedMarketMaker for UniswapV3Pool {
       self.token_b = Token::new(pool.token1().call().await?, provider.clone()).await?;
 
       let mut pool = vec![self.into()];
-      println!("syncing slot 0");
+      println!("syncing slot0");
       UniswapV3Factory::sync_slot_0(&mut pool, block_number, provider.clone()).await?;
       println!("syncing token decimals");
       UniswapV3Factory::sync_token_decimals(&mut pool, provider.clone()).await?;
       println!("syncing tick bitmaps");
-      UniswapV3Factory::sync_tick_bitmaps(&mut pool, block_number, provider.clone()).await?;
+    UniswapV3Factory::sync_tick_bitmaps(&mut pool, block_number, provider.clone()).await?;
       println!("syncing tick data");
       UniswapV3Factory::sync_tick_data(&mut pool, block_number, provider.clone()).await?;
-      println!("syncing done");
-      let AMM::UniswapV3Pool(pool) = pool[0].to_owned() else {
+      let AMM::UniswapV3VariantPool(pool) = pool[0].to_owned() else {
           unreachable!()
       };
 
@@ -832,7 +817,7 @@ impl UniswapV3Factory {
       pools = pools
           .par_drain(..)
           .filter(|pool| match pool {
-              AMM::UniswapV3Pool(uv3_pool) => {
+              AMM::UniswapV3VariantPool(uv3_pool) => {
                   uv3_pool.liquidity > 0
                       && uv3_pool.token_a.decimals > 0
                       && uv3_pool.token_b.decimals > 0
@@ -841,7 +826,9 @@ impl UniswapV3Factory {
           })
           .collect();
 
+      // Try sync_tick_bitmaps first, fall back to v2 if it fails
       UniswapV3Factory::sync_tick_bitmaps(&mut pools, block_number, provider.clone()).await?;
+
       UniswapV3Factory::sync_tick_data(&mut pools, block_number, provider.clone()).await?;
 
       Ok(pools)
@@ -866,7 +853,7 @@ impl UniswapV3Factory {
 
       // Set token decimals
       for pool in pools.iter_mut() {
-          let AMM::UniswapV3Pool(uniswap_v3_pool) = pool else {
+          let AMM::UniswapV3VariantPool(uniswap_v3_pool) = pool else {
               unreachable!()
           };
 
@@ -891,530 +878,560 @@ impl UniswapV3Factory {
       N: Network,
       P: Provider<N> + Clone,
   {
-      let step = 10;
+      let step = 5;
+      const MAX_RETRIES: u32 = 3;
 
       let mut futures = FuturesUnordered::new();
       pools.chunks_mut(step).for_each(|group| {
           let provider = provider.clone();
-          let pool_addresses = group
-              .iter_mut()
-              .map(|pool| pool.address())
-              .collect::<Vec<_>>();
+          let pool_addresses: Vec<Address> = group.iter().map(|pool| pool.address()).collect();
 
           futures.push(async move {
-              Ok::<(&mut [AMM], Bytes), AMMError>((
-                  group,
-                  GetUniswapV3PoolSlot0BatchRequest::deploy_builder(provider, pool_addresses)
-                      .call_raw()
-                      .block(block_number)
-                      .await?,
-              ))
+              let mut results = Vec::new();
+              for pool_address in pool_addresses {
+                  let mut retries = 0;
+                  let mut success = false;
+                  let mut result = None;
+
+                  while retries < MAX_RETRIES && !success {
+                    println!("block number: {}, slot0 for pool {}", block_number, pool_address);
+                      let pool_contract = IUniswapV3Pool::new(pool_address, provider.clone());
+                      let slot0 = pool_contract.slot0().block(block_number).call().await?;
+                      let liquidity = pool_contract.liquidity().block(block_number).call().await?;
+
+                      if slot0.sqrtPriceX96 != U160::ZERO && liquidity != 0 {
+                          result = Some((pool_address, (U256::from(slot0.sqrtPriceX96), slot0.tick.as_i32()), liquidity));
+                          success = true;
+                      } else {
+                          retries += 1;
+                          if retries == MAX_RETRIES {
+                              eprintln!(
+                                  "Pool {} has zero liquidity or sqrt_price after {} retries",
+                                  pool_address,
+                                  MAX_RETRIES
+                              );
+                              return Err(AMMError::InvalidPoolType);
+                          }
+                          tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                      }
+                  }
+
+                  if let Some(res) = result {
+                      results.push(res);
+                  }
+              }
+              Ok::<Vec<(Address, (U256, i32), u128)>, AMMError>(results)
           });
       });
 
-      while let Some(res) = futures.next().await {
-          let (pools, return_data) = res?;
-          let return_data = <Vec<(i32, u128, U256)> as SolValue>::abi_decode(&return_data)?;
-
-          for (slot_0_data, pool) in return_data.iter().zip(pools.iter_mut()) {
-              let AMM::UniswapV3Pool(ref mut uv3_pool) = pool else {
-                  unreachable!()
-              };
-
-              uv3_pool.tick = slot_0_data.0;
-              uv3_pool.liquidity = slot_0_data.1;
-              uv3_pool.sqrt_price = slot_0_data.2;
-          }
-      }
-
-      Ok(())
-  }
-
-  async fn sync_tick_bitmaps<N, P>(
-      pools: &mut [AMM],
-      block_number: BlockId,
-      provider: P,
-  ) -> Result<(), AMMError>
-  where
-      N: Network,
-      P: Provider<N> + Clone,
-  {
-      let mut futures: FuturesUnordered<BoxFuture<'_, _>> = FuturesUnordered::new();
-
-      let max_range = 25;
-      let mut group_range = 0;
-      let mut group = vec![];
-
-      for pool in pools.iter() {
-          let AMM::UniswapV3Pool(uniswap_v3_pool) = pool else {
-              unreachable!()
-          };
-
-          let mut min_word = tick_to_word(MIN_TICK, uniswap_v3_pool.tick_spacing);
-          let max_word = tick_to_word(MAX_TICK, uniswap_v3_pool.tick_spacing);
-          let mut word_range = max_word - min_word;
-
-          while word_range > 0 {
-              let remaining_range = max_range - group_range;
-              let range = word_range.min(remaining_range);
-
-              group.push(TickBitmapInfo {
-                  pool: uniswap_v3_pool.address,
-                  minWord: min_word as i16,
-                  maxWord: (min_word + range) as i16,
-              });
-
-              word_range -= range;
-              min_word += range - 1;
-              group_range += range;
-
-              // If group is full, fire it off and reset
-              if group_range >= max_range {
-                  let provider = provider.clone();
-                  let calldata = std::mem::take(&mut group);
-                  group_range = 0;
-
-                  let calldata_clone = calldata.clone();
-                  futures.push(Box::pin(async move {
-                      let result = GetUniswapV3PoolTickBitmapBatchRequest::deploy_builder(
-                          provider.clone(), calldata.clone(),
-                      )
-                      .call_raw()
-                      .block(block_number)
-                      .await;
-
-                      match result {
-                          Ok(return_data) => {
-                              println!("Tick bitmap batch request succeeded");
-                              Ok::<(Vec<TickBitmapInfo>, Option<Bytes>, Vec<(Address, i16, U256)>), AMMError>((
-                                  calldata_clone,
-                                  Some(return_data),
-                                  Vec::new(),
-                              ))
-                          }
-                          Err(e) => {
-                              println!("Tick bitmap batch request failed: {:?}", e);
-                              // Fallback to individual tick bitmap calls
-                              let mut fallback_results = Vec::new();
-                              for bitmap_info in &calldata {
-                                  let pool_contract = IUniswapV3Pool::new(bitmap_info.pool, provider.clone());
-                                  for word_pos in bitmap_info.minWord..=bitmap_info.maxWord {
-                                      match pool_contract.tickBitmap(word_pos).block(block_number).call().await {
-                                          Ok(bitmap) => {
-                                              fallback_results.push((bitmap_info.pool, word_pos, bitmap));
-                                          }
-                                          Err(e) => {
-                                              println!("Failed to get tick bitmap for pool {} word {}: {:?}", 
-                                                  bitmap_info.pool, word_pos, e);
-                                          }
-                                      }
-                                  }
-                              }
-                              Ok::<(Vec<TickBitmapInfo>, Option<Bytes>, Vec<(Address, i16, U256)>), AMMError>((
-                                  calldata_clone,
-                                  None,
-                                  fallback_results,
-                              ))
-                          }
-                      }
-                  }));
-              }
-          }
-      }
-
-      // Flush group if not empty
-      if !group.is_empty() {
-          let provider = provider.clone();
-          let calldata = std::mem::take(&mut group);
-
-          let calldata_clone = calldata.clone();
-          futures.push(Box::pin(async move {
-              let result = GetUniswapV3PoolTickBitmapBatchRequest::deploy_builder(provider.clone(), calldata.clone())
-                  .call_raw()
-                  .block(block_number)
-                  .await;
-
-              match result {
-                  Ok(return_data) => {
-                      println!("Final tick bitmap batch request succeeded");
-                      Ok::<(Vec<TickBitmapInfo>, Option<Bytes>, Vec<(Address, i16, U256)>), AMMError>((
-                          calldata_clone,
-                          Some(return_data),
-                          Vec::new(),
-                      ))
-                  }
-                  Err(e) => {
-                      println!("Final tick bitmap batch request failed: {:?}", e);
-                      // Fallback to individual tick bitmap calls
-                      let mut fallback_results = Vec::new();
-                      for bitmap_info in &calldata {
-                          let pool_contract = IUniswapV3Pool::new(bitmap_info.pool, provider.clone());
-                          for word_pos in bitmap_info.minWord..=bitmap_info.maxWord {
-                              match pool_contract.tickBitmap(word_pos).block(block_number).call().await {
-                                  Ok(bitmap) => {
-                                      fallback_results.push((bitmap_info.pool, word_pos, bitmap));
-                                  }
-                                  Err(e) => {
-                                      println!("Failed to get tick bitmap for pool {} word {}: {:?}", 
-                                          bitmap_info.pool, word_pos, e);
-                                  }
-                              }
-                          }
-                      }
-                      Ok::<(Vec<TickBitmapInfo>, Option<Bytes>, Vec<(Address, i16, U256)>), AMMError>((
-                          calldata_clone,
-                          None,
-                          fallback_results,
-                      ))
-                  }
-              }
-          }));
-      }
-
-      let mut pool_set = pools
+      let mut pool_map = pools
           .iter_mut()
           .map(|pool| (pool.address(), pool))
           .collect::<HashMap<Address, &mut AMM>>();
 
       while let Some(res) = futures.next().await {
-          match res {
-              Ok((bitmap_info, batch_result, fallback_results)) => {
-                  if let Some(return_data) = batch_result {
-                      // Process successful batch results
-                      let return_data = <Vec<Vec<U256>> as SolValue>::abi_decode(&return_data)?;
-                      
-                      for (tick_bitmaps, bitmap_info) in return_data.iter().zip(bitmap_info.iter()) {
-                          if let Some(pool) = pool_set.get_mut(&bitmap_info.pool) {
-                              let AMM::UniswapV3Pool(ref mut uv3_pool) = pool else {
-                                  unreachable!()
-                              };
+          let results = res?;
+          for (pool_address, (sqrt_price, tick), liquidity) in results {
+              if let Some(pool) = pool_map.get_mut(&pool_address) {
+                  let AMM::UniswapV3VariantPool(ref mut uv3_pool) = pool else {
+                      unreachable!()
+                  };
 
-                              for chunk in tick_bitmaps.chunks_exact(2) {
-                                  let word_pos = I256::from_raw(chunk[0]).as_i16();
-                                  let tick_bitmap = chunk[1];
-                                  uv3_pool.tick_bitmap.insert(word_pos, tick_bitmap);
-                              }
-                          }
-                      }
-                  } else {
-                      // Process fallback results
-                      for (pool_address, word_pos, bitmap) in fallback_results {
-                          if let Some(pool) = pool_set.get_mut(&pool_address) {
-                              let AMM::UniswapV3Pool(ref mut uv3_pool) = pool else {
-                                  unreachable!()
-                              };
-                              println!("Inserting fallback tick bitmap - Word: {}, Bitmap: {:?}", 
-                                  word_pos, bitmap);
-                              uv3_pool.tick_bitmap.insert(word_pos, bitmap);
-                          }
-                      }
-                  }
-              },
-              Err(e) => {
-                  println!("Error getting tick bitmap: {:?}", e);
-                  return Err(e);
+                  uv3_pool.sqrt_price = sqrt_price;
+                  uv3_pool.tick = tick;
+                  uv3_pool.liquidity = liquidity;
               }
           }
       }
+
       Ok(())
   }
 
-  async fn sync_tick_data<N, P>(
-      pools: &mut [AMM],
-      block_number: BlockId,
-      provider: P,
-  ) -> Result<(), AMMError>
-  where
-      N: Network,
-      P: Provider<N> + Clone,
-  {
-      println!("Starting tick data sync...");
-      let pool_ticks = pools
-          .par_iter()
-          .filter_map(|pool| {
-              if let AMM::UniswapV3Pool(uniswap_v3_pool) = pool {
-                  println!("Processing pool for tick data: {}", uniswap_v3_pool.address);
-                  let min_word = tick_to_word(MIN_TICK, uniswap_v3_pool.tick_spacing);
-                  let max_word = tick_to_word(MAX_TICK, uniswap_v3_pool.tick_spacing);
+    async fn sync_tick_bitmaps<N, P>(
+        pools: &mut [AMM],
+        block_number: BlockId,
+        provider: P,
+    ) -> Result<(), AMMError>
+    where
+        N: Network,
+        P: Provider<N> + Clone,
+    {
+        let mut futures: FuturesUnordered<BoxFuture<'_, _>> = FuturesUnordered::new();
 
-                  println!("Pool {} - Min word: {}, Max word: {}", 
-                      uniswap_v3_pool.address, min_word, max_word);
+        let max_range = 25;
+        let mut group_range = 0;
+        let mut group = vec![];
 
-                  let initialized_ticks: Vec<Signed<24, 1>> = (min_word..=max_word)
-                      .filter_map(|word_pos| {
-                          uniswap_v3_pool
-                              .tick_bitmap
-                              .get(&(word_pos as i16))
-                              .filter(|&bitmap| *bitmap != U256::ZERO)
-                              .map(|&bitmap| (word_pos, bitmap))
-                      })
-                      .flat_map(|(word_pos, bitmap)| {
-                          (0..256)
-                              .filter(move |i| {
-                                  (bitmap & (U256::from(1) << U256::from(*i))) != U256::ZERO
-                              })
-                              .map(move |i| {
-                                  let tick_index =
-                                      (word_pos * 256 + i) * uniswap_v3_pool.tick_spacing;
-                                  
-                                  // Validate tick index
-                                  if tick_index < MIN_TICK || tick_index > MAX_TICK {
-                                      println!("Invalid tick index {} (word_pos: {}, bit: {}), skipping", 
-                                          tick_index, word_pos, i);
-                                      return None;
-                                  }
+        for pool in pools.iter() {
+            let AMM::UniswapV3VariantPool(uniswap_v3_pool) = pool else {
+                unreachable!()
+            };
 
-                                  println!("Found valid tick index: {} for word_pos: {}, bit: {}, tick_spacing: {}", 
-                                      tick_index, word_pos, i, uniswap_v3_pool.tick_spacing);
-                                  
-                                  Some(Signed::<24, 1>::from_str(&tick_index.to_string()).unwrap())
-                              })
-                              .flatten()
-                      })
-                      .collect();
+            let mut min_word = tick_to_word(MIN_TICK, uniswap_v3_pool.tick_spacing);
+            let max_word = tick_to_word(MAX_TICK, uniswap_v3_pool.tick_spacing);
+            let mut word_range = max_word - min_word;
 
-                  println!("Found {} initialized ticks for pool {}", 
-                      initialized_ticks.len(), uniswap_v3_pool.address);
+            while word_range > 0 {
+                let remaining_range = max_range - group_range;
+                let range = word_range.min(remaining_range);
 
-                  if !initialized_ticks.is_empty() {
-                      Some((uniswap_v3_pool.address, initialized_ticks))
-                  } else {
-                      None
-                  }
-              } else {
-                  None
-              }
-          })
-          .collect::<Vec<(Address, Vec<Signed<24, 1>>)>>();
+                group.push(TickBitmapInfo {
+                    pool: uniswap_v3_pool.address,
+                    minWord: min_word as i16,
+                    maxWord: (min_word + range) as i16,
+                });
 
-      println!("Total pools with initialized ticks: {}", pool_ticks.len());
+                word_range -= range;
+                min_word += range - 1;
+                group_range += range;
 
-      let mut futures: FuturesUnordered<BoxFuture<'_, _>> = FuturesUnordered::new();
-      let max_ticks = 10; // Increased from 1 to 10 for better batching
-      let mut group_ticks = 0;
-      let mut group = vec![];
+                // If group is full, fire it off and reset
+                if group_range >= max_range {
+                    let provider = provider.clone();
+                    let calldata = std::mem::take(&mut group);
+                    group_range = 0;
 
-      for (pool_address, mut ticks) in pool_ticks {
-          println!("Processing ticks for pool: {}", pool_address);
-          println!("Total ticks to process: {}", ticks.len());
+                    let calldata_clone = calldata.clone();
+                    futures.push(Box::pin(async move {
+                        let result = GetUniswapV3PoolTickBitmapBatchRequest::deploy_builder(
+                            provider.clone(), calldata.clone(),
+                        )
+                        .call_raw()
+                        .block(block_number)
+                        .await;
 
-          // Sort ticks to ensure consistent ordering
-          ticks.sort();
+                        match result {
+                            Ok(return_data) => {
+                                println!("Tick bitmap batch request succeeded");
+                                Ok::<(Vec<TickBitmapInfo>, Option<Bytes>, Vec<(Address, i16, U256)>), AMMError>((
+                                    calldata_clone,
+                                    Some(return_data),
+                                    Vec::new(),
+                                ))
+                            }
+                            Err(e) => {
+                                println!("Tick bitmap batch request failed: {:?}", e);
+                                // Fallback to individual tick bitmap calls
+                                let mut fallback_results = Vec::new();
+                                for bitmap_info in &calldata {
+                                    let pool_contract = IUniswapV3Pool::new(bitmap_info.pool, provider.clone());
+                                    for word_pos in bitmap_info.minWord..=bitmap_info.maxWord {
+                                        match pool_contract.tickBitmap(word_pos).block(block_number).call().await {
+                                            Ok(bitmap) => {
+                                                fallback_results.push((bitmap_info.pool, word_pos, bitmap));
+                                            }
+                                            Err(e) => {
+                                                println!("Failed to get tick bitmap for pool {} word {}: {:?}", 
+                                                    bitmap_info.pool, word_pos, e);
+                                            }
+                                        }
+                                    }
+                                }
+                                Ok::<(Vec<TickBitmapInfo>, Option<Bytes>, Vec<(Address, i16, U256)>), AMMError>((
+                                    calldata_clone,
+                                    None,
+                                    fallback_results,
+                                ))
+                            }
+                        }
+                    }));
+                }
+            }
+        }
 
-          while !ticks.is_empty() {
-              let remaining_ticks = max_ticks - group_ticks;
-              let selected_ticks = ticks.drain(0..remaining_ticks.min(ticks.len()));
-              let selected_ticks: Vec<_> = selected_ticks.collect();
-              group_ticks += selected_ticks.len();
+        // Flush group if not empty
+        if !group.is_empty() {
+            let provider = provider.clone();
+            let calldata = std::mem::take(&mut group);
 
-              // Validate tick values
-              let valid_ticks: Vec<_> = selected_ticks
-                  .into_iter()
-                  .filter(|&tick| {
-                      let tick_value = tick.as_i32();
-                      let is_valid = tick_value >= MIN_TICK && tick_value <= MAX_TICK;
-                      if !is_valid {
-                          println!("Invalid tick value {} (MIN_TICK: {}, MAX_TICK: {}), skipping", 
-                              tick_value, MIN_TICK, MAX_TICK);
-                      }
-                      is_valid
-                  })
-                  .collect();
+            let calldata_clone = calldata.clone();
+            futures.push(Box::pin(async move {
+                let result = GetUniswapV3PoolTickBitmapBatchRequest::deploy_builder(provider.clone(), calldata.clone())
+                    .call_raw()
+                    .block(block_number)
+                    .await;
 
-              if valid_ticks.is_empty() {
-                  println!("No valid ticks in batch, skipping");
-                  continue;
-              }
+                match result {
+                    Ok(return_data) => {
+                        println!("Final tick bitmap batch request succeeded");
+                        Ok::<(Vec<TickBitmapInfo>, Option<Bytes>, Vec<(Address, i16, U256)>), AMMError>((
+                            calldata_clone,
+                            Some(return_data),
+                            Vec::new(),
+                        ))
+                    }
+                    Err(e) => {
+                        println!("Final tick bitmap batch request failed: {:?}", e);
+                        // Fallback to individual tick bitmap calls
+                        let mut fallback_results = Vec::new();
+                        for bitmap_info in &calldata {
+                            let pool_contract = IUniswapV3Pool::new(bitmap_info.pool, provider.clone());
+                            for word_pos in bitmap_info.minWord..=bitmap_info.maxWord {
+                                match pool_contract.tickBitmap(word_pos).block(block_number).call().await {
+                                    Ok(bitmap) => {
+                                        fallback_results.push((bitmap_info.pool, word_pos, bitmap));
+                                    }
+                                    Err(e) => {
+                                        println!("Failed to get tick bitmap for pool {} word {}: {:?}", 
+                                            bitmap_info.pool, word_pos, e);
+                                    }
+                                }
+                            }
+                        }
+                        Ok::<(Vec<TickBitmapInfo>, Option<Bytes>, Vec<(Address, i16, U256)>), AMMError>((
+                            calldata_clone,
+                            None,
+                            fallback_results,
+                        ))
+                    }
+                }
+            }));
+        }
 
-              println!("Adding batch - Pool: {}, Ticks: {:?}", 
-                  pool_address, valid_ticks);
+        let mut pool_set = pools
+            .iter_mut()
+            .map(|pool| (pool.address(), pool))
+            .collect::<HashMap<Address, &mut AMM>>();
 
-              group.push(GetUniswapV3PoolTickDataBatchRequest::TickDataInfo {
-                  pool: pool_address,
-                  ticks: valid_ticks,
-              });
+        while let Some(res) = futures.next().await {
+            match res {
+                Ok((bitmap_info, batch_result, fallback_results)) => {
+                    if let Some(return_data) = batch_result {
+                        // Process successful batch results
+                        let return_data = <Vec<Vec<U256>> as SolValue>::abi_decode(&return_data)?;
+                        
+                        for (tick_bitmaps, bitmap_info) in return_data.iter().zip(bitmap_info.iter()) {
+                            if let Some(pool) = pool_set.get_mut(&bitmap_info.pool) {
+                                let AMM::UniswapV3VariantPool(ref mut uv3_pool) = pool else {
+                                    unreachable!()
+                                };
 
-              if group_ticks >= max_ticks {
-                  let provider = provider.clone();
-                  let calldata = std::mem::take(&mut group);
+                                for chunk in tick_bitmaps.chunks_exact(2) {
+                                    let word_pos = I256::from_raw(chunk[0]).as_i16();
+                                    let tick_bitmap = chunk[1];
+                                    uv3_pool.tick_bitmap.insert(word_pos, tick_bitmap);
+                                }
+                            }
+                        }
+                    } else {
+                        // Process fallback results
+                        for (pool_address, word_pos, bitmap) in fallback_results {
+                            if let Some(pool) = pool_set.get_mut(&pool_address) {
+                                let AMM::UniswapV3VariantPool(ref mut uv3_pool) = pool else {
+                                    unreachable!()
+                                };
+                                println!("Inserting fallback tick bitmap - Word: {}, Bitmap: {:?}", 
+                                    word_pos, bitmap);
+                                uv3_pool.tick_bitmap.insert(word_pos, bitmap);
+                            }
+                        }
+                    }
+                },
+                Err(e) => {
+                    println!("Error getting tick bitmap: {:?}", e);
+                    return Err(e);
+                }
+            }
+        }
+        Ok(())
+    }
 
-                  println!("Sending batch request with {} pools", calldata.len());
-                  for info in &calldata {
-                      println!("  Pool: {}, Ticks: {:?}", info.pool, info.ticks);
-                  }
+    async fn sync_tick_data<N, P>(
+        pools: &mut [AMM],
+        block_number: BlockId,
+        provider: P,
+    ) -> Result<(), AMMError>
+    where
+        N: Network,
+        P: Provider<N> + Clone,
+    {
+        println!("Starting tick data sync...");
+        let pool_ticks = pools
+            .par_iter()
+            .filter_map(|pool| {
+                if let AMM::UniswapV3VariantPool(uniswap_v3_pool) = pool {
+                    println!("Processing pool for tick data: {}", uniswap_v3_pool.address);
+                    let min_word = tick_to_word(MIN_TICK, uniswap_v3_pool.tick_spacing);
+                    let max_word = tick_to_word(MAX_TICK, uniswap_v3_pool.tick_spacing);
 
-                  group_ticks = 0;
-                  group.clear();
+                    println!("Pool {} - Min word: {}, Max word: {}", 
+                        uniswap_v3_pool.address, min_word, max_word);
 
-                  let calldata_clone = calldata.clone();
-                  futures.push(Box::pin(async move {
-                      let result = GetUniswapV3PoolTickDataBatchRequest::deploy_builder(
-                          provider.clone(), calldata.clone(),
-                      )
-                      .call_raw()
-                      .block(block_number)
-                      .await;
+                    let initialized_ticks: Vec<Signed<24, 1>> = (min_word..=max_word)
+                        .filter_map(|word_pos| {
+                            uniswap_v3_pool
+                                .tick_bitmap
+                                .get(&(word_pos as i16))
+                                .filter(|&bitmap| *bitmap != U256::ZERO)
+                                .map(|&bitmap| (word_pos, bitmap))
+                        })
+                        .flat_map(|(word_pos, bitmap)| {
+                            (0..256)
+                                .filter(move |i| {
+                                    (bitmap & (U256::from(1) << U256::from(*i))) != U256::ZERO
+                                })
+                                .map(move |i| {
+                                    let tick_index =
+                                        (word_pos * 256 + i) * uniswap_v3_pool.tick_spacing;
+                                    
+                                    // Validate tick index
+                                    if tick_index < MIN_TICK || tick_index > MAX_TICK {
+                                        println!("Invalid tick index {} (word_pos: {}, bit: {}), skipping", 
+                                            tick_index, word_pos, i);
+                                        return None;
+                                    }
 
-                      match &result {
-                          Ok(_) => println!("Tick data batch request succeeded"),
-                          Err(e) => {
-                              println!("Tick data batch request failed: {:?}", e);
-                              // Fallback to individual tick calls
-                              let mut fallback_results = Vec::new();
-                              for tick_info in &calldata {
-                                  let pool_contract = IUniswapV3Pool::new(tick_info.pool, provider.clone());
-                                  for &tick in &tick_info.ticks {
-                                      match pool_contract.ticks(tick).block(block_number).call().await {
-                                          Ok(tick_data) => {
-                                              fallback_results.push((tick_info.pool, tick, (tick_data.initialized, tick_data.liquidityGross, tick_data.liquidityNet)));
-                                          }
-                                          Err(e) => {
-                                              println!("Failed to get tick data for pool {} tick {}: {:?}", 
-                                                  tick_info.pool, tick, e);
-                                          }
-                                      }
-                                  }
-                              }
-                              return Ok::<(Vec<TickDataInfo>, Vec<(Address, Signed<24, 1>, (bool, u128, i128))>), AMMError>((
-                                  calldata_clone,
-                                  fallback_results,
-                              ));
-                          }
-                      }
+                                    println!("Found valid tick index: {} for word_pos: {}, bit: {}, tick_spacing: {}", 
+                                        tick_index, word_pos, i, uniswap_v3_pool.tick_spacing);
+                                    
+                                    Some(Signed::<24, 1>::from_str(&tick_index.to_string()).unwrap())
+                                })
+                                .flatten()
+                        })
+                        .collect();
 
-                      Ok::<(Vec<TickDataInfo>, Vec<(Address, Signed<24, 1>, (bool, u128, i128))>), AMMError>((
-                          calldata_clone,
-                          Vec::new(),
-                      ))
-                  }));
-              }
-          }
-      }
+                    println!("Found {} initialized ticks for pool {}", 
+                        initialized_ticks.len(), uniswap_v3_pool.address);
 
-      if !group.is_empty() {
-          let provider = provider.clone();
-          let calldata = std::mem::take(&mut group);
+                    if !initialized_ticks.is_empty() {
+                        Some((uniswap_v3_pool.address, initialized_ticks))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<(Address, Vec<Signed<24, 1>>)>>();
 
-          println!("Sending final batch request with {} pools", calldata.len());
-          for info in &calldata {
-              println!("  Pool: {}, Ticks: {:?}", info.pool, info.ticks);
-          }
+        println!("Total pools with initialized ticks: {}", pool_ticks.len());
 
-          let calldata_clone = calldata.clone();
-          futures.push(Box::pin(async move {
-              let result = GetUniswapV3PoolTickDataBatchRequest::deploy_builder(provider.clone(), calldata.clone())
-                  .call_raw()
-                  .block(block_number)
-                  .await;
+        let mut futures: FuturesUnordered<BoxFuture<'_, _>> = FuturesUnordered::new();
+        let max_ticks = 10; // Increased from 1 to 10 for better batching
+        let mut group_ticks = 0;
+        let mut group = vec![];
 
-              match &result {
-                  Ok(_) => println!("Final tick data batch request succeeded"),
-                  Err(e) => {
-                      println!("Final tick data batch request failed: {:?}", e);
-                      // Fallback to individual tick calls
-                      let mut fallback_results = Vec::new();
-                      for tick_info in &calldata {
-                          let pool_contract = IUniswapV3Pool::new(tick_info.pool, provider.clone());
-                          for &tick in &tick_info.ticks {
-                              match pool_contract.ticks(tick).block(block_number).call().await {
-                                  Ok(tick_data) => {
-                                      fallback_results.push((tick_info.pool, tick, (tick_data.initialized, tick_data.liquidityGross, tick_data.liquidityNet)));
-                                  }
-                                  Err(e) => {
-                                      println!("Failed to get tick data for pool {} tick {}: {:?}", 
-                                          tick_info.pool, tick, e);
-                                  }
-                              }
-                          }
-                      }
-                      return Ok::<(Vec<TickDataInfo>, Vec<(Address, Signed<24, 1>, (bool, u128, i128))>), AMMError>((
-                          calldata_clone,
-                          fallback_results,
-                      ));
-                  }
-              }
+        for (pool_address, mut ticks) in pool_ticks {
+            println!("Processing ticks for pool: {}", pool_address);
+            println!("Total ticks to process: {}", ticks.len());
 
-              Ok::<(Vec<TickDataInfo>, Vec<(Address, Signed<24, 1>, (bool, u128, i128))>), AMMError>((
-                  calldata_clone,
-                  Vec::new(),
-              ))
-          }));
-      }
+            // Sort ticks to ensure consistent ordering
+            ticks.sort();
 
-      let mut pool_set = pools
-          .iter_mut()
-          .map(|pool| (pool.address(), pool))
-          .collect::<HashMap<Address, &mut AMM>>();
+            while !ticks.is_empty() {
+                let remaining_ticks = max_ticks - group_ticks;
+                let selected_ticks = ticks.drain(0..remaining_ticks.min(ticks.len()));
+                let selected_ticks: Vec<_> = selected_ticks.collect();
+                group_ticks += selected_ticks.len();
 
-      while let Some(res) = futures.next().await {
-          match res {
-              Ok((tick_info, fallback_results)) => {
-                  if !fallback_results.is_empty() {
-                      // Process fallback results
-                      for (pool_address, tick, tick_data) in fallback_results {
-                          if let Some(pool) = pool_set.get_mut(&pool_address) {
-                              let AMM::UniswapV3Pool(ref mut uv3_pool) = pool else {
-                                  unreachable!()
-                              };
-                              let info = Info {
-                                  liquidity_gross: tick_data.1,
-                                  liquidity_net: tick_data.2,
-                                  initialized: tick_data.0,
-                              };
-                              println!("Inserting fallback tick data - Index: {}, Info: {:?}", 
-                                  tick, info);
-                              uv3_pool.ticks.insert(tick.as_i32(), info);
-                          }
-                      }
-                  } else {
-                      // Process batch results
-                      println!("Successfully got tick data response");
-                      
-                      for info in tick_info {
-                          if let Some(pool) = pool_set.get_mut(&info.pool) {
-                              let AMM::UniswapV3Pool(ref mut uv3_pool) = pool else {
-                                  unreachable!()
-                              };
-                              for tick in info.ticks {
-                                  let pool_contract = IUniswapV3Pool::new(info.pool, provider.clone());
-                                  match pool_contract.ticks(tick).block(block_number).call().await {
-                                      Ok(tick_data) => {
-                                          let info = Info {
-                                              liquidity_gross: tick_data.liquidityGross,
-                                              liquidity_net: tick_data.liquidityNet,
-                                              initialized: tick_data.initialized,
-                                          };
-                                          println!("Inserting tick data - Index: {}, Info: {:?}", 
-                                              tick, info);
-                                          uv3_pool.ticks.insert(tick.as_i32(), info);
-                                      }
-                                      Err(e) => {
-                                          println!("Failed to get tick data for pool {} tick {}: {:?}", 
-                                              info.pool, tick, e);
-                                      }
-                                  }
-                              }
-                          }
-                      }
-                  }
-              },
-              Err(e) => {
-                  println!("Error getting tick data: {:?}", e);
-                  return Err(e);
-              }
-          }
-      }
-      Ok(())
-  }
+                // Validate tick values
+                let valid_ticks: Vec<_> = selected_ticks
+                    .into_iter()
+                    .filter(|&tick| {
+                        let tick_value = tick.as_i32();
+                        let is_valid = tick_value >= MIN_TICK && tick_value <= MAX_TICK;
+                        if !is_valid {
+                            println!("Invalid tick value {} (MIN_TICK: {}, MAX_TICK: {}), skipping", 
+                                tick_value, MIN_TICK, MAX_TICK);
+                        }
+                        is_valid
+                    })
+                    .collect();
+
+                if valid_ticks.is_empty() {
+                    println!("No valid ticks in batch, skipping");
+                    continue;
+                }
+
+                println!("Adding batch - Pool: {}, Ticks: {:?}", 
+                    pool_address, valid_ticks);
+
+                group.push(GetUniswapV3PoolTickDataBatchRequest::TickDataInfo {
+                    pool: pool_address,
+                    ticks: valid_ticks,
+                });
+
+                if group_ticks >= max_ticks {
+                    let provider = provider.clone();
+                    let calldata = std::mem::take(&mut group);
+
+                    println!("Sending batch request with {} pools", calldata.len());
+                    for info in &calldata {
+                        println!("  Pool: {}, Ticks: {:?}", info.pool, info.ticks);
+                    }
+
+                    group_ticks = 0;
+                    group.clear();
+
+                    let calldata_clone = calldata.clone();
+                    futures.push(Box::pin(async move {
+                        let result = GetUniswapV3PoolTickDataBatchRequest::deploy_builder(
+                            provider.clone(), calldata.clone(),
+                        )
+                        .call_raw()
+                        .block(block_number)
+                        .await;
+
+                        match &result {
+                            Ok(_) => println!("Tick data batch request succeeded"),
+                            Err(e) => {
+                                println!("Tick data batch request failed: {:?}", e);
+                                // Fallback to individual tick calls
+                                let mut fallback_results = Vec::new();
+                                for tick_info in &calldata {
+                                    let pool_contract = IUniswapV3Pool::new(tick_info.pool, provider.clone());
+                                    for &tick in &tick_info.ticks {
+                                        match pool_contract.ticks(tick).block(block_number).call().await {
+                                            Ok(tick_data) => {
+                                                fallback_results.push((tick_info.pool, tick, (tick_data.initialized, tick_data.liquidityGross, tick_data.liquidityNet)));
+                                            }
+                                            Err(e) => {
+                                                println!("Failed to get tick data for pool {} tick {}: {:?}", 
+                                                    tick_info.pool, tick, e);
+                                            }
+                                        }
+                                    }
+                                }
+                                return Ok::<(Vec<TickDataInfo>, Vec<(Address, Signed<24, 1>, (bool, u128, i128))>), AMMError>((
+                                    calldata_clone,
+                                    fallback_results,
+                                ));
+                            }
+                        }
+
+                        Ok::<(Vec<TickDataInfo>, Vec<(Address, Signed<24, 1>, (bool, u128, i128))>), AMMError>((
+                            calldata_clone,
+                            Vec::new(),
+                        ))
+                    }));
+                }
+            }
+        }
+
+        if !group.is_empty() {
+            let provider = provider.clone();
+            let calldata = std::mem::take(&mut group);
+
+            println!("Sending final batch request with {} pools", calldata.len());
+            for info in &calldata {
+                println!("  Pool: {}, Ticks: {:?}", info.pool, info.ticks);
+            }
+
+            let calldata_clone = calldata.clone();
+            futures.push(Box::pin(async move {
+                let result = GetUniswapV3PoolTickDataBatchRequest::deploy_builder(provider.clone(), calldata.clone())
+                    .call_raw()
+                    .block(block_number)
+                    .await;
+
+                match &result {
+                    Ok(_) => println!("Final tick data batch request succeeded"),
+                    Err(e) => {
+                        println!("Final tick data batch request failed: {:?}", e);
+                        // Fallback to individual tick calls
+                        let mut fallback_results = Vec::new();
+                        for tick_info in &calldata {
+                            let pool_contract = IUniswapV3Pool::new(tick_info.pool, provider.clone());
+                            for &tick in &tick_info.ticks {
+                                match pool_contract.ticks(tick).block(block_number).call().await {
+                                    Ok(tick_data) => {
+                                        fallback_results.push((tick_info.pool, tick, (tick_data.initialized, tick_data.liquidityGross, tick_data.liquidityNet)));
+                                    }
+                                    Err(e) => {
+                                        println!("Failed to get tick data for pool {} tick {}: {:?}", 
+                                            tick_info.pool, tick, e);
+                                    }
+                                }
+                            }
+                        }
+                        return Ok::<(Vec<TickDataInfo>, Vec<(Address, Signed<24, 1>, (bool, u128, i128))>), AMMError>((
+                            calldata_clone,
+                            fallback_results,
+                        ));
+                    }
+                }
+
+                Ok::<(Vec<TickDataInfo>, Vec<(Address, Signed<24, 1>, (bool, u128, i128))>), AMMError>((
+                    calldata_clone,
+                    Vec::new(),
+                ))
+            }));
+        }
+
+        let mut pool_set = pools
+            .iter_mut()
+            .map(|pool| (pool.address(), pool))
+            .collect::<HashMap<Address, &mut AMM>>();
+
+        while let Some(res) = futures.next().await {
+            match res {
+                Ok((tick_info, fallback_results)) => {
+                    if !fallback_results.is_empty() {
+                        // Process fallback results
+                        for (pool_address, tick, tick_data) in fallback_results {
+                            if let Some(pool) = pool_set.get_mut(&pool_address) {
+                                let AMM::UniswapV3VariantPool(ref mut uv3_pool) = pool else {
+                                    unreachable!()
+                                };
+                                let info = Info {
+                                    liquidity_gross: tick_data.1,
+                                    liquidity_net: tick_data.2,
+                                    initialized: tick_data.0,
+                                };
+                                println!("Inserting fallback tick data - Index: {}, Info: {:?}", 
+                                    tick, info);
+                                uv3_pool.ticks.insert(tick.as_i32(), info);
+                            }
+                        }
+                    } else {
+                        // Process batch results
+                        println!("Successfully got tick data response");
+                        
+                        for info in tick_info {
+                            if let Some(pool) = pool_set.get_mut(&info.pool) {
+                                let AMM::UniswapV3VariantPool(ref mut uv3_pool) = pool else {
+                                    unreachable!()
+                                };
+                                for tick in info.ticks {
+                                    let pool_contract = IUniswapV3Pool::new(info.pool, provider.clone());
+                                    match pool_contract.ticks(tick).block(block_number).call().await {
+                                        Ok(tick_data) => {
+                                            let info = Info {
+                                                liquidity_gross: tick_data.liquidityGross,
+                                                liquidity_net: tick_data.liquidityNet,
+                                                initialized: tick_data.initialized,
+                                            };
+                                            println!("Inserting tick data - Index: {}, Info: {:?}", 
+                                                tick, info);
+                                            uv3_pool.ticks.insert(tick.as_i32(), info);
+                                        }
+                                        Err(e) => {
+                                            println!("Failed to get tick data for pool {} tick {}: {:?}", 
+                                                info.pool, tick, e);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                Err(e) => {
+                    println!("Error getting tick data: {:?}", e);
+                    return Err(e);
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 fn tick_to_word(tick: i32, tick_spacing: i32) -> i32 {
-  let mut compressed = tick / tick_spacing;
-  if tick < 0 && tick % tick_spacing != 0 {
-      compressed -= 1;
-  }
+    let mut compressed = tick / tick_spacing;
+    if tick < 0 && tick % tick_spacing != 0 {
+        compressed -= 1;
+    }
 
-  compressed >> 8
+    compressed >> 8
 }
 
 impl AutomatedMarketMakerFactory for UniswapV3Factory {
@@ -1432,13 +1449,11 @@ impl AutomatedMarketMakerFactory for UniswapV3Factory {
       let pool_created_event: alloy::primitives::Log<IUniswapV3Factory::PoolCreated> =
           IUniswapV3Factory::PoolCreated::decode_log(&log.inner)?;
 
-      Ok(AMM::UniswapV3Pool(UniswapV3Pool {
+      Ok(AMM::UniswapV3VariantPool(UniswapV3Pool {
           address: pool_created_event.pool,
           factory_address: self.address,
           token_a: pool_created_event.token0.into(),
           token_b: pool_created_event.token1.into(),
-          fee: pool_created_event.fee.to::<u32>(),
-          tick_spacing: pool_created_event.tickSpacing.unchecked_into(),
           ..Default::default()
       }))
   }

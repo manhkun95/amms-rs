@@ -40,7 +40,7 @@ contract IUniswapV2Factory {
   event PairCreated(address indexed token0, address indexed token1, bool stable, address pair, uint256);
   function allPairs(uint256) external view returns (address pair);
   function allPairsLength() external view returns (uint256);
-
+  function getFee(address pair, bool stable) external view returns (uint256);
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -194,8 +194,6 @@ impl AutomatedMarketMaker for UniswapV2Pool {
 
       let res = deployer.call_raw().block(block_number).await?;
 
-      println!("res: {:?} {:?} {:?} ", res, self.address(), block_number);
-
       let pool_data =
           <Vec<(Address, Address, u128, u128, u32, u32)> as SolValue>::abi_decode(&res)?[0];
 
@@ -208,7 +206,12 @@ impl AutomatedMarketMaker for UniswapV2Pool {
       self.reserve_0 = pool_data.2;
       self.reserve_1 = pool_data.3;
 
-      // TODO: populate fee?
+      if self.fee == 0 {    
+        // Get fee from factory
+        let factory = IUniswapV2FactoryInstance::new(self.factory_address, provider);
+        let fee = factory.getFee(self.address, self.stable).call().block(block_number).await?;
+        self.fee = fee.to::<usize>();
+      }
 
       Ok(self)
   }
@@ -243,37 +246,40 @@ impl UniswapV2Pool {
       let amount_in = amount_in * fee / U256_100000;
 
       if self.stable {
-        // Normalize reserves to 18 decimals
-        let decimals_in = if token_in == self.token_a.address {
-            self.token_a.decimals
-        } else {
-            self.token_b.decimals
-        };
-        let decimals_out = if token_in == self.token_a.address {
-            self.token_b.decimals
-        } else {
-            self.token_a.decimals
-        };
-
-        // Calculate k first
-        let xy = self.calculate_k(reserve_in, reserve_out, decimals_in, decimals_out);
-
-          let reserve_in_normalized = reserve_in * U256::from(10).pow(U256::from(18 - decimals_in));
-          let reserve_out_normalized = reserve_out * U256::from(10).pow(U256::from(18 - decimals_out));
+          // Calculate k first
+          let xy = self.calculate_k(reserve_in, reserve_out, self.token_a.decimals, self.token_b.decimals);
           
-          // Normalize amount in to 18 decimals
-          let amount_in_normalized = amount_in * U256::from(10).pow(U256::from(18 - decimals_in));
+          // Normalize reserves to 18 decimals
+          let reserve0_normalized = reserve_in * U256::from(10).pow(U256::from(18 - self.token_a.decimals));
+          let reserve1_normalized = reserve_out * U256::from(10).pow(U256::from(18 - self.token_b.decimals));
+          
+        //   // Determine which reserve is A and which is B based on token_in
+        //   let (reserve_a, reserve_b) = if token_in == self.token_a.address {
+        //       (reserve0_normalized, reserve1_normalized)
+        //   } else {
+        //       (reserve1_normalized, reserve0_normalized)
+        //   };
+          
+          // Normalize amount_in based on token_in decimals
+          let amount_in_normalized = if token_in == self.token_a.address {
+              amount_in * U256::from(10).pow(U256::from(18 - self.token_a.decimals))
+          } else {
+              amount_in * U256::from(10).pow(U256::from(18 - self.token_b.decimals))
+          };
           
           // Calculate y using the stable pool formula
-          let y = self.calculate_y(amount_in_normalized + reserve_in_normalized, xy, reserve_out_normalized);
+          let y = reserve1_normalized - self.calculate_y(amount_in_normalized + reserve0_normalized, xy, reserve1_normalized);
           
           // Convert back to original decimals
-          y * U256::from(10).pow(U256::from(decimals_out)) / U256::from(10).pow(U256::from(18))
-      } else {
-          // For non-stable pools, use the original formula
-          let numerator = amount_in * reserve_out;
-          let denominator = reserve_in + amount_in;
-          numerator / denominator
+          let output_decimals = if token_in == self.token_a.address {
+              self.token_b.decimals
+          } else {
+              self.token_a.decimals
+          };
+          
+          y * U256::from(10).pow(U256::from(output_decimals)) / U256::from(10).pow(U256::from(18))
+      } else {          
+          amount_in * reserve_out / (reserve_in + amount_in)
       }
   }
 
@@ -293,38 +299,59 @@ impl UniswapV2Pool {
       }
   }
 
-  /// Helper function to calculate square root of a U256 value
-  fn sqrt_u256(&self, x: U256) -> U256 {
-      if x.is_zero() {
-          return U256::ZERO;
-      }
-      
-      let mut result = U256::ONE;
-      let mut x_aux = x;
-      
-      while x_aux > result {
-          x_aux = x_aux >> 1;
-          result = result << 1;
-      }
-      
-      while result > x_aux {
-          result = (result + x_aux) >> 1;
-          x_aux = x / result;
-      }
-      
-      result
+  /// Helper function to calculate f(x0, y) for stable pools
+  fn calculate_f(&self, x0: U256, y: U256) -> U256 {
+      let a = x0 * y / U256::from(10).pow(U256::from(18));
+      let b = x0 * x0 / U256::from(10).pow(U256::from(18)) + 
+              y * y / U256::from(10).pow(U256::from(18));
+      a * b / U256::from(10).pow(U256::from(18))
   }
 
-  /// Calculates the y value for stable pools using the formula: y = reserveB - _get_y(amountIn+reserveA, xy, reserveB)
-  fn calculate_y(&self, x: U256, k: U256, reserve_b: U256) -> U256 {
-      // This is a simplified version of _get_y
-      // In practice, you would need to implement the full Newton-Raphson method
-      // For now, we'll use a simple approximation
-      let x_squared = x * x / U256::from(10).pow(U256::from(18));
-      let y_squared = k / x_squared;
-      let y = self.sqrt_u256(y_squared * U256::from(10).pow(U256::from(18)));
+  /// Helper function to calculate d(x0, y) for stable pools
+  fn calculate_d(&self, x0: U256, y: U256) -> U256 {
+      let y_squared = y * y / U256::from(10).pow(U256::from(18));
+      let x0_squared = x0 * x0 / U256::from(10).pow(U256::from(18));
+      let x0_cubed = x0_squared * x0 / U256::from(10).pow(U256::from(18));
       
-      reserve_b - y
+      U256::from(3) * x0 * y_squared / U256::from(10).pow(U256::from(18)) + x0_cubed
+  }
+
+  /// Calculates the y value for stable pools using Newton-Raphson method
+  fn calculate_y(&self, x0: U256, xy: U256, y: U256) -> U256 {
+      let mut y = y;
+      let precision = U256::from(10).pow(U256::from(18));
+      
+      for _ in 0..255 {
+          let k = self.calculate_f(x0, y);
+          
+          if k < xy {
+              let dy = (xy - k) * precision / self.calculate_d(x0, y);
+              if dy.is_zero() {
+                  if k == xy {
+                      return y;
+                  }
+                  if self.calculate_f(x0, y + U256::ONE) > xy {
+                      return y + U256::ONE;
+                  }
+                  y += U256::ONE;
+              } else {
+                  y += dy;
+              }
+          } else {
+              let dy = (k - xy) * precision / self.calculate_d(x0, y);
+              if dy.is_zero() {
+                  if k == xy || self.calculate_f(x0, y - U256::ONE) < xy {
+                      return y;
+                  }
+                  y -= U256::ONE;
+              } else {
+                  y -= dy;
+              }
+          }
+      }
+      
+      // If we reach here, we couldn't find a solution
+      y
   }
 
   /// Calculates the price of the base token in terms of the quote token.

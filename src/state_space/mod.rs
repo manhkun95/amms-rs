@@ -13,7 +13,7 @@ use alloy::eips::BlockId;
 use alloy::rpc::types::{Block, Filter, FilterSet, Log};
 use alloy::{
     network::Network,
-    primitives::{Address, FixedBytes},
+    primitives::{Address, FixedBytes, U256},
     providers::Provider,
 };
 use async_stream::stream;
@@ -35,6 +35,7 @@ use tokio::sync::RwLock;
 use tracing::debug;
 use tracing::info;
 use tracing::warn;
+use tracing::error;
 
 pub const CACHE_SIZE: usize = 30;
 
@@ -78,7 +79,7 @@ impl<N, P> StateSpaceManager<N, P> {
 
                 let logs = provider.get_logs(&block_filter).await?;
 
-                let affected_amms = state.write().await.sync_v2(&logs, &self.factories, &self.provider).await?;
+                let affected_amms = state.write().await.sync_v2(&logs, &self.factories, &self.provider, block_number).await?;
                 latest_block.store(block_number, Ordering::Relaxed);
 
                 yield Ok(affected_amms);
@@ -378,8 +379,11 @@ impl StateSpace {
                     Ok(mut new_amm) => {
                         let pool_address = new_amm.address();
                         
+                        // Clone new_amm before first init attempt
+                        let init_amm = new_amm.clone();
+                        
                         // Initialize the new pool
-                        match new_amm.init(alloy::eips::BlockId::Number(alloy::eips::BlockNumberOrTag::Number(log_block_number)), provider.clone()).await {
+                        match init_amm.init(alloy::eips::BlockId::Number(alloy::eips::BlockNumberOrTag::Number(log_block_number)), provider.clone()).await {
                             Ok(initialized_amm) => {
                                 info!(
                                     target: "state_space::sync",
@@ -398,8 +402,60 @@ impl StateSpace {
                                     target: "state_space::sync",
                                     pool_address = ?pool_address,
                                     error = ?e,
-                                    "Failed to initialize new pool"
+                                    "Failed to initialize new pool, attempting retry"
                                 );
+
+                                // Use new_amm for retry attempts since it hasn't been moved
+                                let retry_amm = new_amm;
+
+                                // Retry logic for pool initialization
+                                let max_retries = 3;
+                                let mut retry_count = 0;
+                                let mut success = false;
+
+                                while retry_count < max_retries && !success {
+                                    retry_count += 1;
+                                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+                                    // Clone retry_amm for each attempt
+                                    let attempt_amm = retry_amm.clone();
+                                    match attempt_amm.init(
+                                        alloy::eips::BlockId::Number(alloy::eips::BlockNumberOrTag::Number(log_block_number)),
+                                        provider.clone()
+                                    ).await {
+                                        Ok(initialized_amm) => {
+                                            info!(
+                                                target: "state_space::sync",
+                                                pool_address = ?pool_address,
+                                                factory = ?factory.address(),
+                                                retry_count,
+                                                "Successfully initialized pool after retry"
+                                            );
+                                            
+                                            self.state.insert(pool_address, initialized_amm);
+                                            affected_amms.insert(pool_address);
+                                            success = true;
+                                        }
+                                        Err(retry_error) => {
+                                            warn!(
+                                                target: "state_space::sync",
+                                                pool_address = ?pool_address,
+                                                error = ?retry_error,
+                                                retry_count,
+                                                "Failed to initialize pool on retry attempt"
+                                            );
+                                        }
+                                    }
+                                }
+
+                                if !success {
+                                    error!(
+                                        target: "state_space::sync",
+                                        pool_address = ?pool_address,
+                                        retry_count,
+                                        "Failed to initialize pool after all retry attempts"
+                                    );
+                                }
                             }
                         }
                     }
@@ -447,7 +503,8 @@ impl StateSpace {
         &mut self, 
         logs: &[Log], 
         factories: &[Factory], 
-        provider: P
+        provider: P,
+        block_number: u64
     ) -> Result<Vec<Address>, StateSpaceError> 
     where
         N: Network,
@@ -483,33 +540,17 @@ impl StateSpace {
         let mut recovered_pools = Vec::new();
         
         for log in logs {
-            // If the block number is updated, cache the current block state changes
-            let log_block_number = log
-                .block_number
-                .ok_or(StateSpaceError::MissingBlockNumber)?;
-            if log_block_number != block_number {
-                let amms = cached_amms.drain().collect::<Vec<AMM>>();
-                affected_amms.extend(amms.iter().map(|amm| amm.address()));
-                let state_change = StateChange::new(amms, block_number);
-
-                debug!(
-                    target: "state_space::sync_v2",
-                    state_change = ?state_change,
-                    "Caching state change"
-                );
-
-                self.cache.push(state_change);
-                block_number = log_block_number;
-            }
-
             // Check if this is a pool creation event
             if let Some(factory) = Self::is_pool_creation_event(log, factories) {
                 match factory.create_pool(log.clone()) {
                     Ok(new_amm) => {
                         let pool_address = new_amm.address();
                         
+                        // Clone new_amm before first init attempt
+                        let init_amm = new_amm.clone();
+                        
                         // Initialize the new pool
-                        match new_amm.init(alloy::eips::BlockId::Number(alloy::eips::BlockNumberOrTag::Number(log_block_number)), provider.clone()).await {
+                        match init_amm.init(alloy::eips::BlockId::Number(alloy::eips::BlockNumberOrTag::Number(block_number)), provider.clone()).await {
                             Ok(initialized_amm) => {
                                 info!(
                                     target: "state_space::sync_v2",
@@ -528,8 +569,60 @@ impl StateSpace {
                                     target: "state_space::sync_v2",
                                     pool_address = ?pool_address,
                                     error = ?e,
-                                    "Failed to initialize new pool"
+                                    "Failed to initialize new pool, attempting retry"
                                 );
+
+                                // Use new_amm for retry attempts since it hasn't been moved
+                                let retry_amm = new_amm;
+
+                                // Retry logic for pool initialization
+                                let max_retries = 3;
+                                let mut retry_count = 0;
+                                let mut success = false;
+
+                                while retry_count < max_retries && !success {
+                                    retry_count += 1;
+                                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+                                    // Clone retry_amm for each attempt
+                                    let attempt_amm = retry_amm.clone();
+                                    match attempt_amm.init(
+                                        alloy::eips::BlockId::Number(alloy::eips::BlockNumberOrTag::Number(block_number)),
+                                        provider.clone()
+                                    ).await {
+                                        Ok(initialized_amm) => {
+                                            info!(
+                                                target: "state_space::sync_v2",
+                                                pool_address = ?pool_address,
+                                                factory = ?factory.address(),
+                                                retry_count,
+                                                "Successfully initialized pool after retry"
+                                            );
+                                            
+                                            self.state.insert(pool_address, initialized_amm);
+                                            affected_amms.insert(pool_address);
+                                            success = true;
+                                        }
+                                        Err(retry_error) => {
+                                            warn!(
+                                                target: "state_space::sync_v2",
+                                                pool_address = ?pool_address,
+                                                error = ?retry_error,
+                                                retry_count,
+                                                "Failed to initialize pool on retry attempt"
+                                            );
+                                        }
+                                    }
+                                }
+
+                                if !success {
+                                    error!(
+                                        target: "state_space::sync_v2",
+                                        pool_address = ?pool_address,
+                                        retry_count,
+                                        "Failed to initialize pool after all retry attempts"
+                                    );
+                                }
                             }
                         }
                     }
@@ -545,6 +638,69 @@ impl StateSpace {
             // If the AMM is in the state space add the current state to cache and sync from log
             else if let Some(amm) = self.state.get_mut(&log.address()) {
                 cached_amms.insert(amm.clone());
+
+                // check uniswap_v3 && empty ticks
+                if let AMM::UniswapV3Pool(pool) = amm {
+                    if pool.liquidity != 0 && pool.ticks.is_empty() {
+                        match self.reset_pool_to_initial_state(
+                            log.address(),
+                            block_number,
+                            &provider
+                        ).await {
+                            Ok(reset_amm) => {
+                                info!(
+                                    target: "state_space::sync_v2", 
+                                    pool_address = ?log.address(),
+                                    "Successfully reset pool to initial state after panic"
+                                );
+                                self.state.insert(log.address(), reset_amm);
+                                recovered_pools.push(log.address());
+                                affected_amms.insert(log.address());
+                            }
+                            Err(reset_err) => {
+                                warn!(
+                                    target: "state_space::sync_v2",
+                                    pool_address = ?log.address(),
+                                    error = ?reset_err,
+                                    "Failed to reset pool after panic, removing from state"
+                                );
+                                self.state.remove(&log.address());
+                            }
+                        }
+
+                        continue;
+                    }
+                } else if let AMM::UniswapV3VariantPool(pool) = amm {
+                    if pool.liquidity != 0 && pool.ticks.is_empty() {
+                        match self.reset_pool_to_initial_state(
+                            log.address(),
+                            block_number,
+                            &provider
+                        ).await {
+                            Ok(reset_amm) => {
+                                info!(
+                                    target: "state_space::sync_v2", 
+                                    pool_address = ?log.address(),
+                                    "Successfully reset UniswapV3Variant pool to initial state after panic"
+                                );
+                                self.state.insert(log.address(), reset_amm);
+                                recovered_pools.push(log.address());
+                                affected_amms.insert(log.address());
+                            }
+                            Err(reset_err) => {
+                                warn!(
+                                    target: "state_space::sync_v2",
+                                    pool_address = ?log.address(),
+                                    error = ?reset_err,
+                                    "Failed to reset UniswapV3Variant pool after panic, removing from state"
+                                );
+                                self.state.remove(&log.address());
+                            }
+                        }
+
+                        continue;
+                    }
+                }
                 
                 // Try to sync with underflow protection using panic catching
                 let sync_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -590,7 +746,11 @@ impl StateSpace {
                             );
                             
                             // Reset the pool to a clean state 
-                            match self.reset_pool_to_initial_state(log.address(), log_block_number, &provider).await {
+                            match self.reset_pool_to_initial_state(
+                                log.address(),
+                                block_number,
+                                &provider
+                            ).await {
                                 Ok(reset_amm) => {
                                     info!(
                                         target: "state_space::sync_v2", 
@@ -665,33 +825,77 @@ impl StateSpace {
         // Create a fresh pool instance based on the pool type
         use crate::amms::amm::AMM;
         
-        // Try to create a fresh UniswapV3 pool since that's where underflow occurs
-        let fresh_pool = crate::amms::uniswap_v3::UniswapV3Pool::new(pool_address, Address::default());
+        // Get the existing pool to get its factory address
+        let existing_pool = self.state.get(&pool_address)
+            .ok_or_else(|| StateSpaceError::AMMError(AMMError::from(crate::amms::uniswap_v3::UniswapV3Error::LiquidityUnderflow)))?;
+            
+        let factory_address = match existing_pool {
+            AMM::UniswapV3Pool(pool) => pool.factory_address,
+            AMM::UniswapV3VariantPool(pool) => pool.factory_address,
+            _ => return Err(StateSpaceError::AMMError(AMMError::from(crate::amms::uniswap_v3::UniswapV3Error::LiquidityUnderflow))),
+        };
         
-        // Initialize it at the specific block to get clean state
-        match fresh_pool.init(
-            alloy::eips::BlockId::Number(alloy::eips::BlockNumberOrTag::Number(block_number)), 
-            provider.clone()
-        ).await {
-            Ok(initialized_pool) => {
-                info!(
-                    target: "state_space::sync_v2",
-                    pool_address = ?pool_address,
-                    block = block_number,
-                    "Successfully created fresh pool state"
-                );
-                Ok(AMM::UniswapV3Pool(initialized_pool))
+        // Try to create a fresh UniswapV3 pool since that's where underflow occurs
+        match existing_pool {
+            AMM::UniswapV3Pool(_) => {
+                let fresh_pool = crate::amms::uniswap_v3::UniswapV3Pool::new(pool_address, factory_address);
+                
+                // Initialize it at the specific block to get clean state
+                match fresh_pool.init(
+                    alloy::eips::BlockId::Number(alloy::eips::BlockNumberOrTag::Number(block_number)), 
+                    provider.clone()
+                ).await {
+                    Ok(initialized_pool) => {
+                        info!(
+                            target: "state_space::sync_v2",
+                            pool_address = ?pool_address,
+                            block = block_number,
+                            "Successfully created fresh UniswapV3Pool state"
+                        );
+                        Ok(AMM::UniswapV3Pool(initialized_pool))
+                    }
+                    Err(e) => {
+                        warn!(
+                            target: "state_space::sync_v2",
+                            pool_address = ?pool_address,
+                            block = block_number,
+                            error = ?e,
+                            "Failed to initialize fresh UniswapV3Pool"
+                        );
+                        Err(StateSpaceError::AMMError(e))
+                    }
+                }
             }
-            Err(e) => {
-                warn!(
-                    target: "state_space::sync_v2",
-                    pool_address = ?pool_address,
-                    block = block_number,
-                    error = ?e,
-                    "Failed to initialize fresh pool"
-                );
-                Err(StateSpaceError::AMMError(e))
+            AMM::UniswapV3VariantPool(_) => {
+                let fresh_pool = crate::amms::uniswap_v3_variant::UniswapV3Pool::new(pool_address, factory_address);
+                
+                // Initialize it at the specific block to get clean state
+                match fresh_pool.init(
+                    alloy::eips::BlockId::Number(alloy::eips::BlockNumberOrTag::Number(block_number)), 
+                    provider.clone()
+                ).await {
+                    Ok(initialized_pool) => {
+                        info!(
+                            target: "state_space::sync_v2",
+                            pool_address = ?pool_address,
+                            block = block_number,
+                            "Successfully created fresh UniswapV3VariantPool state"
+                        );
+                        Ok(AMM::UniswapV3VariantPool(initialized_pool))
+                    }
+                    Err(e) => {
+                        warn!(
+                            target: "state_space::sync_v2",
+                            pool_address = ?pool_address,
+                            block = block_number,
+                            error = ?e,
+                            "Failed to initialize fresh UniswapV3VariantPool"
+                        );
+                        Err(StateSpaceError::AMMError(e))
+                    }
+                }
             }
+            _ => return Err(StateSpaceError::AMMError(AMMError::from(crate::amms::uniswap_v3::UniswapV3Error::LiquidityUnderflow))),
         }
     }
 

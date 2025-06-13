@@ -1,4 +1,7 @@
-use super::{amm::Variant, uniswap_v2::UniswapV2Factory, uniswap_v2_variant::UniswapV2Factory as UniswapV2VariantFactory, uniswap_v3::UniswapV3Factory};
+use super::{amm::Variant, uniswap_v2::UniswapV2Factory,
+    uniswap_v2_variant::UniswapV2Factory as UniswapV2VariantFactory, uniswap_v3::UniswapV3Factory,
+    uniswap_v3_variant::UniswapV3Factory as UniswapV3VariantFactory
+};
 use super::{
     amm::{AutomatedMarketMaker, AMM},
     balancer::BalancerFactory,
@@ -156,7 +159,7 @@ macro_rules! factory {
     };
 }
 
-factory!(UniswapV2Factory, UniswapV2VariantFactory, UniswapV3Factory, BalancerFactory);
+factory!(UniswapV2Factory, UniswapV2VariantFactory, UniswapV3Factory, UniswapV3VariantFactory, BalancerFactory);
 
 #[derive(Default)]
 pub struct NoopAMM;

@@ -13,7 +13,7 @@ use alloy::eips::BlockId;
 use alloy::rpc::types::{Block, Filter, FilterSet, Log};
 use alloy::{
     network::Network,
-    primitives::{Address, FixedBytes, U256},
+    primitives::{Address, FixedBytes},
     providers::Provider,
 };
 use async_stream::stream;
@@ -138,7 +138,6 @@ where
 
     pub async fn sync(self) -> Result<StateSpaceManager<N, P>, AMMError> {
         let chain_tip = BlockId::from(self.provider.get_block_number().await?);
-        let factories = self.factories.clone();
         let mut futures = FuturesUnordered::new();
 
         let mut filter_set = HashSet::new();
@@ -169,9 +168,10 @@ where
                 .push(amm);
         }
 
-        for factory in factories {
+        for factory in &self.factories {
             let provider = self.provider.clone();
             let filters = self.filters.clone();
+            let factory = factory.clone();
 
             let extension = amm_variants.remove(&factory.variant());
             futures.push(tokio::spawn(async move {
@@ -232,12 +232,15 @@ where
 
         // Sync remaining AMM variants
         for (_, remaining_amms) in amm_variants.drain() {
-            for mut amm in remaining_amms {
+            for amm in remaining_amms {
                 let address = amm.address();
-                amm = amm.init(chain_tip, self.provider.clone()).await?;
-                state_space.state.insert(address, amm);
+                let initialized_amm = amm.init(chain_tip, self.provider.clone()).await?;
+                state_space.state.insert(address, initialized_amm);
             }
         }
+
+        // Build indexes after all pools are loaded
+        state_space.rebuild_indexes();
 
         Ok(StateSpaceManager {
             latest_block: Arc::new(AtomicU64::new(self.latest_block)),
@@ -250,8 +253,6 @@ where
     }
 
     pub async fn no_sync(self) -> Result<StateSpaceManager<N, P>, AMMError> {
-        let factories = self.factories.clone();
-
         let mut filter_set = HashSet::new();
         for factory in &self.factories {
             // Add pool creation events to track new pools
@@ -283,7 +284,7 @@ where
 
         // Sync remaining AMM variants
         for (_, remaining_amms) in amm_variants.drain() {
-            for mut amm in remaining_amms {
+            for amm in remaining_amms {
                 let address = amm.address();
                 state_space.state.insert(address, amm);
             }
@@ -305,6 +306,12 @@ pub struct StateSpace {
     pub state: HashMap<Address, AMM>,
     pub latest_block: Arc<AtomicU64>,
     cache: StateChangeCache<CACHE_SIZE>,
+    
+    // 🆕 ROUTING INDEXES
+    /// Maps token address -> set of pool addresses containing that token
+    pub token_to_pools: HashMap<String, HashSet<Address>>,
+    /// Maps token pair -> set of pool addresses for that pair
+    pub token_pair_to_pools: HashMap<(String, String), HashSet<Address>>,
 }
 
 impl StateSpace {
@@ -314,6 +321,207 @@ impl StateSpace {
 
     pub fn get_mut(&mut self, address: &Address) -> Option<&mut AMM> {
         self.state.get_mut(address)
+    }
+
+    // 🆕 ROUTING INDEX METHODS
+    /// Get all pools containing a specific token
+    pub fn get_pools_by_token(&self, token_address: &str) -> Vec<Address> {
+        self.token_to_pools
+            .get(&token_address.to_lowercase())
+            .map(|pools| pools.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Get all pools for a specific token pair
+    pub fn get_pools_by_token_pair(&self, token_a: &str, token_b: &str) -> Vec<Address> {
+        let token_a = token_a.to_lowercase();
+        let token_b = token_b.to_lowercase();
+        
+        let mut pools = HashSet::new();
+        
+        // Check both directions (A,B) and (B,A)
+        if let Some(pair_pools) = self.token_pair_to_pools.get(&(token_a.clone(), token_b.clone())) {
+            pools.extend(pair_pools);
+        }
+        if let Some(pair_pools) = self.token_pair_to_pools.get(&(token_b, token_a)) {
+            pools.extend(pair_pools);
+        }
+        
+        pools.into_iter().collect()
+    }
+
+    /// Get all tokens connected to a specific token
+    pub fn get_connected_tokens(&self, token_address: &str) -> Vec<String> {
+        let token_address = token_address.to_lowercase();
+        let mut connected_tokens = HashSet::new();
+        
+        // Find all pools containing this token
+        if let Some(pool_addresses) = self.token_to_pools.get(&token_address) {
+            for pool_address in pool_addresses {
+                if let Some(amm) = self.state.get(pool_address) {
+                    let tokens = self.extract_tokens_from_amm(amm);
+                    for token in tokens {
+                        let token_lower = token.to_lowercase();
+                        if token_lower != token_address {
+                            connected_tokens.insert(token_lower);
+                        }
+                    }
+                }
+            }
+        }
+        
+        connected_tokens.into_iter().collect()
+    }
+
+    /// Extract token addresses from an AMM
+    fn extract_tokens_from_amm(&self, amm: &AMM) -> Vec<String> {
+        match amm {
+            AMM::UniswapV2Pool(pool) => vec![
+                format!("{:?}", pool.token_a.address),
+                format!("{:?}", pool.token_b.address),
+            ],
+            AMM::UniswapV3Pool(pool) => vec![
+                format!("{:?}", pool.token_a.address),
+                format!("{:?}", pool.token_b.address),
+            ],
+            AMM::UniswapV3VariantPool(pool) => vec![
+                format!("{:?}", pool.token_a.address),
+                format!("{:?}", pool.token_b.address),
+            ],
+            AMM::UniswapV2VariantPool(pool) => vec![
+                format!("{:?}", pool.token_a.address),
+                format!("{:?}", pool.token_b.address),
+            ],
+            AMM::ERC4626Vault(vault) => vec![
+                format!("{:?}", vault.vault_token),
+                format!("{:?}", vault.asset_token),
+            ],
+            AMM::BalancerPool(pool) => {
+                pool.tokens().iter().map(|token| format!("{:?}", token)).collect()
+            },
+        }
+    }
+
+    /// Check if a pool meets the minimum liquidity/reserve requirements
+    fn meets_minimum_requirements(&self, amm: &AMM) -> bool {
+        match amm {
+            AMM::UniswapV3Pool(pool) => pool.liquidity != 0,
+            AMM::UniswapV3VariantPool(pool) => pool.liquidity != 0,
+            AMM::UniswapV2Pool(pool) => {
+                let reserve_0 = pool.reserve_0 as f64 / 10f64.powi(pool.token_a.decimals as i32);
+                let reserve_1 = pool.reserve_1 as f64 / 10f64.powi(pool.token_b.decimals as i32);
+                reserve_0 > 0.01 && reserve_1 > 0.01
+            },
+            AMM::UniswapV2VariantPool(pool) => {
+                let reserve_0 = pool.reserve_0 as f64 / 10f64.powi(pool.token_a.decimals as i32);
+                let reserve_1 = pool.reserve_1 as f64 / 10f64.powi(pool.token_b.decimals as i32);
+                reserve_0 > 0.01 && reserve_1 > 0.01
+            },
+            _ => true, // For other pool types, always include them
+        }
+    }
+
+    /// Add a pool to all relevant indexes
+    fn add_pool_to_indexes(&mut self, pool_address: Address, amm: &AMM) {
+        // Only add to indexes if pool meets minimum requirements
+
+        println!("ADD POOL: {:?}", pool_address);
+        if !self.meets_minimum_requirements(amm) {
+            println!("NOT MEETS MINIMUM REQUIREMENTS POOL: {:?}", pool_address);
+            debug!(
+                target: "state_space::add_pool_to_indexes",
+                pool_address = ?pool_address,
+                "Skipping pool addition to indexes - does not meet minimum requirements"
+            );
+            return;
+        }
+
+        let tokens = self.extract_tokens_from_amm(amm);
+        
+        // Add to token_to_pools index
+        for token in &tokens {
+            let token_lower = token.to_lowercase();
+            self.token_to_pools
+                .entry(token_lower)
+                .or_insert_with(HashSet::new)
+                .insert(pool_address);
+        }
+        
+        // Add to token_pair_to_pools index (for pairs)
+        if tokens.len() >= 2 {
+            let token_a = tokens[0].to_lowercase();
+            let token_b = tokens[1].to_lowercase();
+            
+            self.token_pair_to_pools
+                .entry((token_a.clone(), token_b.clone()))
+                .or_insert_with(HashSet::new)
+                .insert(pool_address);
+                
+            // Also add reverse pair for easy lookup
+            self.token_pair_to_pools
+                .entry((token_b, token_a))
+                .or_insert_with(HashSet::new)
+                .insert(pool_address);
+        }
+    }
+
+    /// Remove a pool from all relevant indexes
+    fn remove_pool_from_indexes(&mut self, pool_address: Address, amm: &AMM) {
+        let tokens = self.extract_tokens_from_amm(amm);
+        
+        // Remove from token_to_pools index
+        for token in &tokens {
+            let token_lower = token.to_lowercase();
+            if let Some(pools) = self.token_to_pools.get_mut(&token_lower) {
+                pools.remove(&pool_address);
+                if pools.is_empty() {
+                    self.token_to_pools.remove(&token_lower);
+                }
+            }
+        }
+        
+        // Remove from token_pair_to_pools index
+        if tokens.len() >= 2 {
+            let token_a = tokens[0].to_lowercase();
+            let token_b = tokens[1].to_lowercase();
+            
+            // Remove from both directions
+            if let Some(pools) = self.token_pair_to_pools.get_mut(&(token_a.clone(), token_b.clone())) {
+                pools.remove(&pool_address);
+                if pools.is_empty() {
+                    self.token_pair_to_pools.remove(&(token_a.clone(), token_b.clone()));
+                }
+            }
+            
+            if let Some(pools) = self.token_pair_to_pools.get_mut(&(token_b.clone(), token_a.clone())) {
+                pools.remove(&pool_address);
+                if pools.is_empty() {
+                    self.token_pair_to_pools.remove(&(token_b, token_a));
+                }
+            }
+        }
+    }
+
+    /// Rebuild all indexes from current state
+    pub fn rebuild_indexes(&mut self) {
+        // Clear existing indexes
+        self.token_to_pools.clear();
+        self.token_pair_to_pools.clear();
+        
+        // Rebuild from current state - collect addresses and AMMs first to avoid borrowing conflicts
+        let pools_to_index: Vec<(Address, AMM)> = self.state.iter().map(|(addr, amm)| (*addr, amm.clone())).collect();
+        
+        for (pool_address, amm) in pools_to_index {
+            self.add_pool_to_indexes(pool_address, &amm);
+        }
+        
+        info!(
+            target: "state_space::rebuild_indexes",
+            pools_count = self.state.len(),
+            token_indexes = self.token_to_pools.len(),
+            pair_indexes = self.token_pair_to_pools.len(),
+            "Rebuilt routing indexes"
+        );
     }
 
     pub async fn sync<N, P>(
@@ -347,12 +555,21 @@ impl StateSpace {
             let cached_state = self.cache.unwind_state_changes(block_number);
             for amm in cached_state {
                 debug!(target: "state_space::sync", ?amm, "Reverting AMM state");
-                self.state.insert(amm.address(), amm);
+                
+                // Update indexes when reverting
+                let address = amm.address();
+                if let Some(old_amm) = self.state.get(&address).cloned() {
+                    self.remove_pool_from_indexes(address, &old_amm);
+                }
+                
+                self.state.insert(address, amm.clone());
+                self.add_pool_to_indexes(address, &amm); // Re-add after revert
             }
         }
 
         let mut cached_amms = HashSet::new();
         let mut affected_amms = HashSet::new();
+        
         for log in logs {
             // If the block number is updated, cache the current block state changes
             let log_block_number = log
@@ -376,7 +593,7 @@ impl StateSpace {
             // Check if this is a pool creation event
             if let Some(factory) = Self::is_pool_creation_event(log, factories) {
                 match factory.create_pool(log.clone()) {
-                    Ok(mut new_amm) => {
+                    Ok(new_amm) => {
                         let pool_address = new_amm.address();
                         
                         // Clone new_amm before first init attempt
@@ -392,9 +609,11 @@ impl StateSpace {
                                     "New pool discovered and initialized"
                                 );
                                 
-                                self.state.insert(pool_address, initialized_amm);
+                                // 🆕 ADD NEW POOL TO INDEXES
+                                self.state.insert(pool_address, initialized_amm.clone());
+                                self.add_pool_to_indexes(pool_address, &initialized_amm);
+                                
                                 affected_amms.insert(pool_address);
-
                                 println!("Inserted new pool: {:?}", pool_address);
                             }
                             Err(e) => {
@@ -405,10 +624,8 @@ impl StateSpace {
                                     "Failed to initialize new pool, attempting retry"
                                 );
 
-                                // Use new_amm for retry attempts since it hasn't been moved
+                                // Retry logic with index updates...
                                 let retry_amm = new_amm;
-
-                                // Retry logic for pool initialization
                                 let max_retries = 3;
                                 let mut retry_count = 0;
                                 let mut success = false;
@@ -417,7 +634,6 @@ impl StateSpace {
                                     retry_count += 1;
                                     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
-                                    // Clone retry_amm for each attempt
                                     let attempt_amm = retry_amm.clone();
                                     match attempt_amm.init(
                                         alloy::eips::BlockId::Number(alloy::eips::BlockNumberOrTag::Number(log_block_number)),
@@ -432,7 +648,10 @@ impl StateSpace {
                                                 "Successfully initialized pool after retry"
                                             );
                                             
-                                            self.state.insert(pool_address, initialized_amm);
+                                            // 🆕 ADD RETRIED POOL TO INDEXES
+                                            self.state.insert(pool_address, initialized_amm.clone());
+                                            self.add_pool_to_indexes(pool_address, &initialized_amm);
+                                            
                                             affected_amms.insert(pool_address);
                                             success = true;
                                         }
@@ -470,13 +689,27 @@ impl StateSpace {
             }
             // If the AMM is in the state space add the current state to cache and sync from log
             else if let Some(amm) = self.state.get_mut(&log.address()) {
+                // Cache old state for potential revert
                 cached_amms.insert(amm.clone());
+                
+                // Save old state and pool address before sync
+                let old_amm = amm.clone();
+                let pool_address = log.address();
+                
+                // Sync the AMM
                 amm.sync(log)?;
+                
+                // Update indexes: remove old, add new (need to do this after releasing the mutable borrow)
+                let updated_amm = amm.clone();
+                let _ = amm; // Release the mutable borrow
+                
+                self.remove_pool_from_indexes(pool_address, &old_amm);
+                self.add_pool_to_indexes(pool_address, &updated_amm);
 
                 info!(
                     target: "state_space::sync",
-                    ?amm,
-                    "Synced AMM"
+                    ?updated_amm,
+                    "Synced AMM and updated indexes"
                 );
             }
         }
@@ -504,14 +737,14 @@ impl StateSpace {
         logs: &[Log], 
         factories: &[Factory], 
         provider: P,
-        block_number: u64
+        _block_number: u64
     ) -> Result<Vec<Address>, StateSpaceError> 
     where
         N: Network,
         P: Provider<N> + Clone,
     {
         let latest = self.latest_block.load(Ordering::Relaxed);
-        let Some(mut block_number) = logs
+        let Some(block_number) = logs
             .first()
             .map(|log| log.block_number.ok_or(StateSpaceError::MissingBlockNumber))
             .transpose()?
@@ -531,7 +764,15 @@ impl StateSpace {
             let cached_state = self.cache.unwind_state_changes(block_number);
             for amm in cached_state {
                 debug!(target: "state_space::sync_v2", ?amm, "Reverting AMM state");
-                self.state.insert(amm.address(), amm);
+                
+                // Update indexes when reverting
+                let address = amm.address();
+                if let Some(old_amm) = self.state.get(&address).cloned() {
+                    self.remove_pool_from_indexes(address, &old_amm);
+                }
+                
+                self.state.insert(address, amm.clone());
+                self.add_pool_to_indexes(address, &amm); // Re-add after revert
             }
         }
 
@@ -546,10 +787,8 @@ impl StateSpace {
                     Ok(new_amm) => {
                         let pool_address = new_amm.address();
                         
-                        // Clone new_amm before first init attempt
                         let init_amm = new_amm.clone();
                         
-                        // Initialize the new pool
                         match init_amm.init(alloy::eips::BlockId::Number(alloy::eips::BlockNumberOrTag::Number(block_number)), provider.clone()).await {
                             Ok(initialized_amm) => {
                                 info!(
@@ -559,9 +798,11 @@ impl StateSpace {
                                     "New pool discovered and initialized"
                                 );
                                 
-                                self.state.insert(pool_address, initialized_amm);
+                                // 🆕 ADD NEW POOL TO INDEXES
+                                self.state.insert(pool_address, initialized_amm.clone());
+                                self.add_pool_to_indexes(pool_address, &initialized_amm);
+                                
                                 affected_amms.insert(pool_address);
-
                                 println!("Inserted new pool: {:?}", pool_address);
                             }
                             Err(e) => {
@@ -572,10 +813,8 @@ impl StateSpace {
                                     "Failed to initialize new pool, attempting retry"
                                 );
 
-                                // Use new_amm for retry attempts since it hasn't been moved
+                                // Retry logic with index updates...
                                 let retry_amm = new_amm;
-
-                                // Retry logic for pool initialization
                                 let max_retries = 3;
                                 let mut retry_count = 0;
                                 let mut success = false;
@@ -584,7 +823,6 @@ impl StateSpace {
                                     retry_count += 1;
                                     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
-                                    // Clone retry_amm for each attempt
                                     let attempt_amm = retry_amm.clone();
                                     match attempt_amm.init(
                                         alloy::eips::BlockId::Number(alloy::eips::BlockNumberOrTag::Number(block_number)),
@@ -599,7 +837,10 @@ impl StateSpace {
                                                 "Successfully initialized pool after retry"
                                             );
                                             
-                                            self.state.insert(pool_address, initialized_amm);
+                                            // 🆕 ADD RETRIED POOL TO INDEXES
+                                            self.state.insert(pool_address, initialized_amm.clone());
+                                            self.add_pool_to_indexes(pool_address, &initialized_amm);
+                                            
                                             affected_amms.insert(pool_address);
                                             success = true;
                                         }
@@ -639,88 +880,96 @@ impl StateSpace {
             else if let Some(amm) = self.state.get_mut(&log.address()) {
                 cached_amms.insert(amm.clone());
 
-                // check uniswap_v3 && empty ticks
-                if let AMM::UniswapV3Pool(pool) = amm {
-                    if pool.liquidity != 0 && pool.ticks.is_empty() {
-                        match self.reset_pool_to_initial_state(
-                            log.address(),
-                            block_number,
-                            &provider
-                        ).await {
-                            Ok(reset_amm) => {
-                                info!(
-                                    target: "state_space::sync_v2", 
-                                    pool_address = ?log.address(),
-                                    "Successfully reset pool to initial state after panic"
-                                );
-                                self.state.insert(log.address(), reset_amm);
-                                recovered_pools.push(log.address());
-                                affected_amms.insert(log.address());
-                            }
-                            Err(reset_err) => {
-                                warn!(
-                                    target: "state_space::sync_v2",
-                                    pool_address = ?log.address(),
-                                    error = ?reset_err,
-                                    "Failed to reset pool after panic, removing from state"
-                                );
-                                self.state.remove(&log.address());
-                            }
-                        }
+                // Handle UniswapV3 underflow detection
+                let should_reset = match amm {
+                    AMM::UniswapV3Pool(pool) => pool.liquidity != 0 && pool.ticks.is_empty(),
+                    AMM::UniswapV3VariantPool(pool) => pool.liquidity != 0 && pool.ticks.is_empty(),
+                    _ => false,
+                };
 
-                        continue;
-                    }
-                } else if let AMM::UniswapV3VariantPool(pool) = amm {
-                    if pool.liquidity != 0 && pool.ticks.is_empty() {
-                        match self.reset_pool_to_initial_state(
-                            log.address(),
-                            block_number,
-                            &provider
-                        ).await {
-                            Ok(reset_amm) => {
-                                info!(
-                                    target: "state_space::sync_v2", 
-                                    pool_address = ?log.address(),
-                                    "Successfully reset UniswapV3Variant pool to initial state after panic"
-                                );
-                                self.state.insert(log.address(), reset_amm);
-                                recovered_pools.push(log.address());
-                                affected_amms.insert(log.address());
+                if should_reset {
+                    let pool_address = log.address();
+                    // Drop the mutable borrow before calling reset_pool_to_initial_state
+                    let _ = amm;
+                    
+                    match self.reset_pool_to_initial_state(
+                        pool_address,
+                        _block_number,
+                        &provider
+                    ).await {
+                        Ok(reset_amm) => {
+                            info!(
+                                target: "state_space::sync_v2", 
+                                pool_address = ?pool_address,
+                                "Successfully reset pool to initial state after panic"
+                            );
+                            
+                            // Get the old AMM for index updates
+                            if let Some(old_amm) = self.state.get(&pool_address).cloned() {
+                                self.remove_pool_from_indexes(pool_address, &old_amm);
                             }
-                            Err(reset_err) => {
-                                warn!(
-                                    target: "state_space::sync_v2",
-                                    pool_address = ?log.address(),
-                                    error = ?reset_err,
-                                    "Failed to reset UniswapV3Variant pool after panic, removing from state"
-                                );
-                                self.state.remove(&log.address());
-                            }
+                            
+                            self.state.insert(pool_address, reset_amm.clone());
+                            self.add_pool_to_indexes(pool_address, &reset_amm);
+                            
+                            recovered_pools.push(pool_address);
+                            affected_amms.insert(pool_address);
                         }
-
-                        continue;
+                        Err(reset_err) => {
+                            warn!(
+                                target: "state_space::sync_v2",
+                                pool_address = ?pool_address,
+                                error = ?reset_err,
+                                "Failed to reset pool after panic, removing from state"
+                            );
+                            
+                            // Remove pool from indexes and state
+                            if let Some(old_amm) = self.state.get(&pool_address).cloned() {
+                                self.remove_pool_from_indexes(pool_address, &old_amm);
+                            }
+                            self.state.remove(&pool_address);
+                        }
                     }
+                    continue;
                 }
                 
                 // Try to sync with underflow protection using panic catching
+                let old_amm = amm.clone(); // Save for index update
+                let pool_address = log.address();
+                
+                // Clone amm for panic catching
+                let _amm_for_sync = amm.clone();
+                let _ = amm; // Drop the mutable borrow before panic catching
+                
                 let sync_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    amm.sync(log)
+                    // We need to get a fresh mutable reference since we dropped the previous one
+                    if let Some(fresh_amm) = self.state.get_mut(&pool_address) {
+                        fresh_amm.sync(log)
+                    } else {
+                        Err(AMMError::from(crate::amms::uniswap_v3::UniswapV3Error::LiquidityUnderflow))
+                    }
                 }));
                 
                 match sync_result {
                     Ok(Ok(_)) => {
-                        info!(
-                            target: "state_space::sync_v2",
-                            ?amm,
-                            "Synced AMM successfully"
-                        );
+                        // Update indexes after successful sync
+                        if let Some(updated_amm) = self.state.get(&pool_address) {
+                            let updated_amm_clone = updated_amm.clone();
+                            self.remove_pool_from_indexes(pool_address, &old_amm);
+                            self.add_pool_to_indexes(pool_address, &updated_amm_clone);
+                            
+                            info!(
+                                target: "state_space::sync_v2",
+                                ?updated_amm_clone,
+                                "Synced AMM successfully and updated indexes"
+                            );
+                        }
                     }
                     Ok(Err(e)) => {
-                        // Regular error from sync method
                         return Err(e.into());
                     }
                     Err(panic_info) => {
-                        // Panic occurred during sync
+                        // Handle panic with index cleanup
                         let panic_message = if let Some(s) = panic_info.downcast_ref::<String>() {
                             s.clone()
                         } else if let Some(s) = panic_info.downcast_ref::<&str>() {
@@ -731,55 +980,65 @@ impl StateSpace {
                         
                         warn!(
                             target: "state_space::sync_v2",
-                            pool_address = ?log.address(),
+                            pool_address = ?pool_address,
                             panic_msg = %panic_message,
                             "Panic caught during AMM sync"
                         );
                         
-                        // Check if this is an underflow panic
                         if panic_message.contains("attempt to subtract with overflow") || 
                            panic_message.contains("LiquidityUnderflow") {
-                            warn!(
-                                target: "state_space::sync_v2",
-                                pool_address = ?log.address(),
-                                "UniswapV3 underflow panic detected, resetting pool to initial state"
-                            );
-                            
-                            // Reset the pool to a clean state 
+                            // Reset pool and update indexes
                             match self.reset_pool_to_initial_state(
-                                log.address(),
-                                block_number,
+                                pool_address,
+                                _block_number,
                                 &provider
                             ).await {
                                 Ok(reset_amm) => {
                                     info!(
                                         target: "state_space::sync_v2", 
-                                        pool_address = ?log.address(),
+                                        pool_address = ?pool_address,
                                         "Successfully reset pool to initial state after panic"
                                     );
-                                    self.state.insert(log.address(), reset_amm);
-                                    recovered_pools.push(log.address());
-                                    affected_amms.insert(log.address());
+                                    
+                                    // Update indexes for reset pool
+                                    if let Some(old_amm) = self.state.get(&pool_address).cloned() {
+                                        self.remove_pool_from_indexes(pool_address, &old_amm);
+                                    }
+                                    self.state.insert(pool_address, reset_amm.clone());
+                                    self.add_pool_to_indexes(pool_address, &reset_amm);
+                                    
+                                    recovered_pools.push(pool_address);
+                                    affected_amms.insert(pool_address);
                                 }
                                 Err(reset_err) => {
                                     warn!(
                                         target: "state_space::sync_v2",
-                                        pool_address = ?log.address(),
+                                        pool_address = ?pool_address,
                                         error = ?reset_err,
                                         "Failed to reset pool after panic, removing from state"
                                     );
-                                    self.state.remove(&log.address());
+                                    
+                                    // Remove pool from indexes
+                                    if let Some(old_amm) = self.state.get(&pool_address).cloned() {
+                                        self.remove_pool_from_indexes(pool_address, &old_amm);
+                                    }
+                                    self.state.remove(&pool_address);
                                 }
                             }
                         } else {
-                            // Non-underflow panic, re-panic to maintain original behavior
+                            // Non-underflow panic - remove pool completely
                             warn!(
                                 target: "state_space::sync_v2",
-                                pool_address = ?log.address(),
+                                pool_address = ?pool_address,
                                 panic_msg = %panic_message,
                                 "Non-underflow panic during sync, removing pool from state"
                             );
-                            self.state.remove(&log.address());
+                            
+                            // Remove pool from indexes
+                            if let Some(old_amm) = self.state.get(&pool_address).cloned() {
+                                self.remove_pool_from_indexes(pool_address, &old_amm);
+                            }
+                            self.state.remove(&pool_address);
                         }
                     }
                 }
@@ -815,7 +1074,7 @@ impl StateSpace {
     async fn reset_pool_to_initial_state<N, P>(
         &self,
         pool_address: Address,
-        block_number: u64,
+        _block_number: u64,
         provider: &P,
     ) -> Result<AMM, StateSpaceError>
     where
@@ -842,14 +1101,14 @@ impl StateSpace {
                 
                 // Initialize it at the specific block to get clean state
                 match fresh_pool.init(
-                    alloy::eips::BlockId::Number(alloy::eips::BlockNumberOrTag::Number(block_number)), 
+                    alloy::eips::BlockId::Number(alloy::eips::BlockNumberOrTag::Number(_block_number)), 
                     provider.clone()
                 ).await {
                     Ok(initialized_pool) => {
                         info!(
                             target: "state_space::sync_v2",
                             pool_address = ?pool_address,
-                            block = block_number,
+                            block = _block_number,
                             "Successfully created fresh UniswapV3Pool state"
                         );
                         Ok(AMM::UniswapV3Pool(initialized_pool))
@@ -858,7 +1117,7 @@ impl StateSpace {
                         warn!(
                             target: "state_space::sync_v2",
                             pool_address = ?pool_address,
-                            block = block_number,
+                            block = _block_number,
                             error = ?e,
                             "Failed to initialize fresh UniswapV3Pool"
                         );
@@ -871,14 +1130,14 @@ impl StateSpace {
                 
                 // Initialize it at the specific block to get clean state
                 match fresh_pool.init(
-                    alloy::eips::BlockId::Number(alloy::eips::BlockNumberOrTag::Number(block_number)), 
+                    alloy::eips::BlockId::Number(alloy::eips::BlockNumberOrTag::Number(_block_number)), 
                     provider.clone()
                 ).await {
                     Ok(initialized_pool) => {
                         info!(
                             target: "state_space::sync_v2",
                             pool_address = ?pool_address,
-                            block = block_number,
+                            block = _block_number,
                             "Successfully created fresh UniswapV3VariantPool state"
                         );
                         Ok(AMM::UniswapV3VariantPool(initialized_pool))
@@ -887,7 +1146,7 @@ impl StateSpace {
                         warn!(
                             target: "state_space::sync_v2",
                             pool_address = ?pool_address,
-                            block = block_number,
+                            block = _block_number,
                             error = ?e,
                             "Failed to initialize fresh UniswapV3VariantPool"
                         );

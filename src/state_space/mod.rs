@@ -960,7 +960,6 @@ impl StateSpace {
                             
                             info!(
                                 target: "state_space::sync_v2",
-                                ?updated_amm_clone,
                                 "Synced AMM successfully and updated indexes"
                             );
                         }

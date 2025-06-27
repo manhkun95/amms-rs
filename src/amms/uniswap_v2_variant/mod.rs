@@ -247,38 +247,38 @@ impl UniswapV2Pool {
       let amount_in = amount_in * fee / U256_100000;
 
       if self.stable {
-          // Calculate k first
-          let xy = self.calculate_k(reserve_in, reserve_out, self.token_a.decimals, self.token_b.decimals);
+          // Determine which token is token_in and get corresponding decimals
+          let (token_in_decimals, token_out_decimals) = if token_in == self.token_a.address {
+              (self.token_a.decimals, self.token_b.decimals)
+          } else {
+              (self.token_b.decimals, self.token_a.decimals)
+          };
+
+          // Calculate k using correct token decimals for reserve mapping
+          let xy = if token_in == self.token_a.address {
+              // token_in is token_a, so reserve_in maps to reserve_0, reserve_out maps to reserve_1
+              self.calculate_k(reserve_in, reserve_out, self.token_a.decimals, self.token_b.decimals)
+          } else {
+              // token_in is token_b, so reserve_in maps to reserve_1, reserve_out maps to reserve_0
+              self.calculate_k(reserve_in, reserve_out, self.token_b.decimals, self.token_a.decimals)
+          };
           
-          // Normalize reserves to 18 decimals
-          let reserve0_normalized = reserve_in * U256::from(10).pow(U256::from(18 - self.token_a.decimals));
-          let reserve1_normalized = reserve_out * U256::from(10).pow(U256::from(18 - self.token_b.decimals));
-          
-        //   // Determine which reserve is A and which is B based on token_in
-        //   let (reserve_a, reserve_b) = if token_in == self.token_a.address {
-        //       (reserve0_normalized, reserve1_normalized)
-        //   } else {
-        //       (reserve1_normalized, reserve0_normalized)
-        //   };
+          // Normalize reserves to 18 decimals using correct token decimals
+          let reserve_in_normalized = reserve_in * U256::from(10).pow(U256::from(18 - token_in_decimals));
+          let reserve_out_normalized = reserve_out * U256::from(10).pow(U256::from(18 - token_out_decimals));
           
           // Normalize amount_in based on token_in decimals
-          let amount_in_normalized = if token_in == self.token_a.address {
-              amount_in * U256::from(10).pow(U256::from(18 - self.token_a.decimals))
-          } else {
-              amount_in * U256::from(10).pow(U256::from(18 - self.token_b.decimals))
-          };
+          let amount_in_normalized = amount_in * U256::from(10).pow(U256::from(18 - token_in_decimals));
           
           // Calculate y using the stable pool formula
-          let y = reserve1_normalized - self.calculate_y(amount_in_normalized + reserve0_normalized, xy, reserve1_normalized);
+          let y = reserve_out_normalized - self.calculate_y(
+              amount_in_normalized + reserve_in_normalized, 
+              xy, 
+              reserve_out_normalized
+          );
           
           // Convert back to original decimals
-          let output_decimals = if token_in == self.token_a.address {
-              self.token_b.decimals
-          } else {
-              self.token_a.decimals
-          };
-          
-          y * U256::from(10).pow(U256::from(output_decimals)) / U256::from(10).pow(U256::from(18))
+          y * U256::from(10).pow(U256::from(token_out_decimals)) / U256::from(10).pow(U256::from(18))
       } else {          
           amount_in * reserve_out / (reserve_in + amount_in)
       }
